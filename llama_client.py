@@ -15,8 +15,9 @@ HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots
 import httpx
 import logging
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 
-from config import REQUEST_TIMEOUT
+from config import REQUEST_TIMEOUT, BACKEND_MODE
 
 log = logging.getLogger(__name__)
 
@@ -114,15 +115,15 @@ class LlamaClient:
 
     async def save_slot(self, slot_id: int, basename: str, model_id: str = None) -> bool:
         # JSON body: {"filename": "..."} — иначе 500 на некоторых сборках
-        if model_id:
-            from urllib.parse import quote
+        if BACKEND_MODE == "llama-swap" and model_id:
             path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
         else:
             path = f"/slots/{slot_id}"
+
         resp = await self.client.post(
             path,
             params={"action": "save"},
-            json={"filename": basename},
+            json={"filename": basename, "model":model_id},
         )
 
         if resp.status_code == 500:
@@ -137,15 +138,15 @@ class LlamaClient:
         return True
 
     async def restore_slot(self, slot_id: int, basename: str, model_id: str = None) -> bool:
-        if model_id:
-            from urllib.parse import quote
+        if BACKEND_MODE == "llama-swap" and model_id:
             path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
         else:
             path = f"/slots/{slot_id}"
+
         resp = await self.client.post(
             path,
             params={"action": "restore"},
-            json={"filename": basename},
+            json={"filename": basename, "model":model_id},
         )
 
         if resp.status_code != 200:

@@ -1,3 +1,4 @@
 kv_meta/
 venv/
 __pycache__/
+run-proxycache.ps1
