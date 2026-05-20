@@ -3,13 +3,12 @@
 # -*- coding: utf-8 -*-
 
 """
-HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots save/restore, /v1/models.
+HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots save/restore.
 
 - stream: build_request+send(stream=True), сырые байты.
 - non-stream: строгий JSON парсинг + fallback, если content-type не JSON.
 - /slots: filename в JSON-теле (во избежание 500 parse error).
 - Пин слота дублируется в root/options/query.
-- get_model_id(): получает текущий id модели с /v1/models.
 """
 
 import httpx
@@ -165,42 +164,120 @@ class LlamaClient:
 
         return True
 
-    async def get_model_id(self) -> str:
+    async def _parse_router_models(self) -> list:
         """
-        Получает id модели у конкретного llama.cpp через /v1/models.
-
-        Используется только для внутреннего кеширования (ключи файлов/мета),
-        наружу прокси продолжает отдавать MODEL_ID из своей конфигурации.
+        GET /models — returns list of {id, status.value, status.args} for each
+        child-process model.  Only models with status == 'loaded' are returned.
+        Each entry has {'name': str, 'port': int}.
         """
         try:
-            resp = await self.client.get("/v1/models")
+            resp = await self.client.get("/models")
             resp.raise_for_status()
             data = resp.json()
-            models = data.get("data") or []
-            if models and isinstance(models[0], dict):
-                mid = models[0].get("id") or "unknown"
-            else:
-                mid = "unknown"
-            log.debug("get_model_id base_url=%s id=%s", self.base_url, mid)
-            return mid
         except Exception as e:
-            log.warning("get_model_id_fail base_url=%s err=%s", self.base_url, e)
-            return "unknown"
+            log.warning("router_models_fail base_url=%s err=%s", self.base_url, e)
+            return []
 
-    async def get_slots_info(self) -> Optional[list]:
-        """GET /slots — returns list of slot dicts, or None on error."""
+        models_data = data.get("data") or []
+        result = []
+        for m in models_data:
+            status_obj = m.get("status") or {}
+            if status_obj.get("value") != "loaded":
+                continue
+            args = status_obj.get("args") or []
+            port = None
+            for i, arg in enumerate(args):
+                if arg == "--port" and i + 1 < len(args):
+                    try:
+                        port = int(args[i + 1])
+                    except ValueError:
+                        pass
+                    break
+            if port is None:
+                log.warning("router_models_no_port model=%s", m.get("id", "?"))
+                continue
+            result.append({"name": m.get("id", ""), "port": port})
+        return result
+
+    async def _get_child_slots(self, child_url: str) -> Optional[list]:
+        """GET /slots on a child process, returns list or None."""
+        try:
+            resp = await self.client.get(f"{child_url}/slots")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.warning("child_slots_fail url=%s err=%s", child_url, e)
+            return None
+
+    async def get_slots_info(self, model_id: Optional[str] = None) -> Optional[list]:
+        """GET /slots — returns list of slot dicts, or None on error.
+
+        Fallback for router mode: when the main /slots endpoint returns
+        HTTP 400 ("model name is missing from the request"), we query
+        GET /models to find loaded child-process models, then call
+        /slots on the relevant child's own port.
+
+        If model_id is provided, only queries that model's child process.
+        If model_id is None, queries all loaded child processes.
+        """
+        # Fast path: normal (non-router) mode
         try:
             resp = await self.client.get("/slots")
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400:
+                log.info(
+                    "slots_400_router_mode base_url=%s — falling back to /models",
+                    self.base_url,
+                )
+                return await self._get_slots_via_router_models(model_id)
+            raise
         except Exception as e:
             log.warning("get_slots_info_fail base_url=%s err=%s", self.base_url, e)
             return None
 
-    async def get_slot_count(self) -> int:
-        """Returns slot count from GET /slots, fallback to 1."""
-        info = await self.get_slots_info()
-        if info and isinstance(info, list):
-            return len(info)
-        log.warning("get_slot_count_fallback_to_1 base_url=%s", self.base_url)
-        return 1
+    async def _get_slots_via_router_models(self, model_id: Optional[str] = None) -> Optional[list]:
+        """Query slots from loaded child processes via GET /models.
+
+        If model_id is provided, only queries that model's child process.
+        Otherwise queries all loaded child processes.
+        """
+        models = await self._parse_router_models()
+        if not models:
+            log.warning("router_models_empty base_url=%s", self.base_url)
+            return None
+
+        # Filter to requested model if specified
+        if model_id:
+            models = [m for m in models if m["name"] == model_id]
+            if not models:
+                log.warning(
+                    "router_model_not_loaded model=%s available=%s",
+                    model_id, [m["name"] for m in models],
+                )
+                return None
+
+        all_slots = []
+        for m in models:
+            child_url = f"http://127.0.0.1:{m['port']}"
+            slots = await self._get_child_slots(child_url)
+            if slots and isinstance(slots, list):
+                for s in slots:
+                    s["_router_model"] = m["name"]
+                    s["_router_port"] = m["port"]
+                all_slots.extend(slots)
+                log.debug(
+                    "router_slots_child name=%s port=%d count=%d",
+                    m["name"], m["port"], len(slots),
+                )
+            else:
+                log.warning(
+                    "router_slots_child_empty name=%s port=%d",
+                    m["name"], m["port"],
+                )
+
+        if all_slots:
+            return all_slots
+        log.warning("router_slots_empty base_url=%s", self.base_url)
+        return None

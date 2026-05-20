@@ -230,28 +230,6 @@ def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
     return deleted
 
 
-def touch_meta(key: str) -> None:
-    """
-    Обновляет timestamp в существующем meta-файле key.meta.json.
-    """
-    path = os.path.join(META_DIR, f"{key}{META_SUFFIX}")
-    try:
-        with open(path, "r+", encoding="utf-8") as f:
-            try:
-                meta = json.load(f)
-            except Exception as e:
-                log.warning("touch_meta_read_fail key=%s: %s", key[:16], e)
-                return
-            meta["timestamp"] = time.time()
-            f.seek(0)
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-            f.truncate()
-        log.debug("touch_meta_ok key=%s", key[:16])
-    except FileNotFoundError:
-        log.warning("touch_meta_missing key=%s", key[:16])
-    except Exception as e:
-        log.warning("touch_meta_fail key=%s: %s", key[:16], e)
-
 def _get_last_used_time(basename: str, meta_dir: str, cache_dir: str) -> float:
     """
     Determines the last-used timestamp for a cache file.

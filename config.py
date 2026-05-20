@@ -13,13 +13,12 @@ import json
 import logging
 
 # Backends
-BACKENDS_RAW = os.getenv("BACKENDS")
-if BACKENDS_RAW:
-    try:
-        BACKENDS = json.loads(BACKENDS_RAW)
-    except Exception:
-        BACKENDS = []
-else:
+try:
+    BACKENDS = json.loads(os.getenv("BACKENDS", "[]"))
+except Exception:
+    BACKENDS = []
+
+if not BACKENDS:
     BACKENDS = [{
         "url": os.getenv("LLAMA_URL", "http://127.0.0.1:8000"),
     }]
@@ -53,9 +52,6 @@ PORT = int(os.getenv("PORT", "8081"))
 CACHE_DIR = os.getenv("CACHE_DIR", "")  # llama.cpp --slot-save-path directory
 CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
 CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25"))
-
-# Slot auto-discovery
-SLOTS_REFRESH_INTERVAL_SECONDS = int(os.getenv("SLOTS_REFRESH_INTERVAL_SECONDS", "60"))
 
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

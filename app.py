@@ -15,10 +15,10 @@ Simple KV Proxy (бронебойный):
 - Для stream:
     * чтение из llama.cpp идёт в отдельной фоновой задаче (reader);
     * reader пушит чанки в asyncio.Queue;
-    * в своём finally reader всегда делает save_after + write_meta + release(g),
+    * в своём finally reader всегда делает save_after + write_meta + release,
       и кладёт в очередь sentinel None;
     * StreamingResponse читает из очереди и никак не влияет на release слота.
-- Slot count auto-discovered from GET /slots on startup and periodically.
+- Slot pools are per-model with lazy discovery + refresh cooldown.
 - Cache cleanup runs after every 5 saves (min 10 min apart).
 """
 
@@ -33,11 +33,10 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, 
+from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
-                    SLOTS_REFRESH_INTERVAL_SECONDS)
-                    
+                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
+
 import hashing as hs
 from llama_client import LlamaClient
 from slot_manager import SlotManager, GSlot
@@ -50,46 +49,18 @@ STREAM_QUEUE_SIZE = 16
 app = FastAPI(title="Simple KV Proxy")
 
 
-def _slot_refresh_worker(clients):
-    """Runs in a real OS thread to avoid blocking the asyncio event loop."""
-    import time
-    while True:
-        time.sleep(SLOTS_REFRESH_INTERVAL_SECONDS)
-        for i, client in enumerate(clients):
-            try:
-                count = client.get_slot_count()
-                log.debug("slot_refresh be=%d count=%d", i, count)
-            except Exception as e:
-                log.warning("slot_refresh_be%d_error: %s", i, e)
-
-
-async def _periodic_slots_refresh(executor, clients):
-    loop = asyncio.get_running_loop()
-    while True:
-        await loop.run_in_executor(executor, _slot_refresh_worker, clients)
-
-
 @app.on_event("startup")
 async def startup():
     clients = [LlamaClient(be["url"]) for be in BACKENDS]
 
-    # Auto-discover slot counts
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=2)
-    discovered_slots = {}
-    for be_id, be in enumerate(BACKENDS):
-        count = await loop.run_in_executor(executor, clients[be_id].get_slot_count)
-        discovered_slots[be_id] = count
-
-    sm = SlotManager(discovered_slots)
+    sm = SlotManager()
     sm.set_clients(clients)
     sm.init_from_disk(CACHE_DIR)
 
     app.state.clients = clients
     app.state.sm = sm
-    app.state.executor = executor
-    log.info("app_start n_backends=%d slots=%s port=%d",
-             len(BACKENDS), discovered_slots, PORT)
+    app.state.executor = ThreadPoolExecutor(max_workers=2)
+    log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
 
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
     reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR)
@@ -101,9 +72,6 @@ async def startup():
         cache_files = len(os.listdir(CACHE_DIR))
         log.info("startup_sanity: %d meta files after reconcile, %d cache files on disk",
                  len(hs.scan_all_meta()), cache_files)
-
-    # Periodic slot refresh in a real OS thread (not asyncio)
-    loop.create_task(_periodic_slots_refresh(executor, clients))
 
 
 @app.on_event("shutdown")
@@ -124,31 +92,36 @@ async def models():
 
 async def start_stream_task(
     resp: httpx.Response,
-    g: GSlot,
+    model_name: str,
+    backend_id: int,
+    slot_id: int,
     key: str,
     prefix: str,
     blocks: List[str],
-    model_id: str,
     sm: SlotManager,
 ) -> AsyncGenerator[bytes, None]:
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
 
     async def reader():
         try:
-            log.info("stream_reader_start g=%s key=%s", g, key[:16])
+            log.info("stream_reader_start model=%s be=%d slot=%d key=%s",
+                     model_name, backend_id, slot_id, key[:16])
             async for chunk in resp.aiter_raw():
                 if not chunk:
                     continue
                 try:
                     await queue.put(chunk)
                 except asyncio.CancelledError:
-                    log.warning("stream_reader_cancelled_put g=%s key=%s", g, key[:16])
+                    log.warning("stream_reader_cancelled_put model=%s be=%d slot=%d key=%s",
+                                model_name, backend_id, slot_id, key[:16])
                     raise
         except asyncio.CancelledError:
-            log.warning("stream_reader_cancelled g=%s key=%s", g, key[:16])
+            log.warning("stream_reader_cancelled model=%s be=%d slot=%d key=%s",
+                        model_name, backend_id, slot_id, key[:16])
             raise
         except Exception as e:
-            log.exception("stream_reader_error g=%s key=%s: %s", g, key[:16], e)
+            log.exception("stream_reader_error model=%s be=%d slot=%d key=%s: %s",
+                          model_name, backend_id, slot_id, key[:16], e)
         finally:
             try:
                 await resp.aclose()
@@ -156,17 +129,20 @@ async def start_stream_task(
                 pass
             ok = False
             try:
-                ok, _ = await sm.save_after(g, key, model_id)
+                ok, _ = await sm.save_after(model_name, backend_id, slot_id, key, model_name)
             except asyncio.CancelledError:
-                log.warning("save_after_cancelled g=%s key=%s", g, key[:16])
+                log.warning("save_after_cancelled model=%s be=%d slot=%d",
+                            model_name, backend_id, slot_id)
             except Exception as e:
-                log.warning("save_after_exception g=%s key=%s: %s", g, key[:16], e)
+                log.warning("save_after_exception model=%s be=%d slot=%d: %s",
+                            model_name, backend_id, slot_id, e)
             try:
-                hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_id)
+                hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
             except Exception as e:
                 log.warning("write_meta_exception key=%s: %s", key[:16], e)
-            sm.release(g)
-            log.info("stream_reader_done g=%s key=%s saved=%s", g, key[:16], ok)
+            sm.release(model_name, backend_id, slot_id)
+            log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
+                     model_name, backend_id, slot_id, key[:16], ok)
             try:
                 await queue.put(None)
             except asyncio.CancelledError:
@@ -209,7 +185,6 @@ async def chat(req: Request):
     messages: List[Dict] = data.get("messages") or []
     stream = bool(data.get("stream", False))
     client_model = data.get("model") or MODEL_ID
-    # model_id aus dem Request nehmen, nicht von /v1/models
     backend_model_id = client_model
 
     prefix = hs.raw_prefix(messages)
@@ -244,31 +219,34 @@ async def chat(req: Request):
         )
 
     log.info(
-        "before_acquire is_big=%s restore_key=%s",
+        "before_acquire is_big=%s restore_key=%s model=%s",
         is_big,
         restore_key[:16] if restore_key else None,
+        backend_model_id,
     )
 
     try:
         g, lock, restored = await asyncio.wait_for(
-            sm.acquire_for_request(restore_key if is_big else None, backend_model_id),
+            sm.acquire_for_request(backend_model_id, restore_key if is_big else None),
             timeout=ACQUIRE_TIMEOUT,
         )
     except asyncio.TimeoutError:
         log.error(
-            "acquire_timeout is_big=%s restore_key=%s",
+            "acquire_timeout is_big=%s restore_key=%s model=%s",
             is_big,
             restore_key[:16] if restore_key else None,
+            backend_model_id,
         )
         return JSONResponse(
             {"error": "all slots busy, please retry later"},
             status_code=503,
         )
 
-    log.info("after_acquire g=%s restored=%s", g, restored)
-
-    be_id, slot_id = g
+    model_name, be_id, slot_id = g
     client = clients[be_id]
+
+    log.info("after_acquire model=%s be=%d slot=%d restored=%s",
+             model_name, be_id, slot_id, restored)
 
     body = dict(data)
     body["model"] = client_model
@@ -283,13 +261,13 @@ async def chat(req: Request):
     body["options"] = opts
 
     log.info(
-        "dispatch be=%d slot=%d is_big=%s (restore_target=%s restored=%s model_id=%s)",
+        "dispatch model=%s be=%d slot=%d is_big=%s (restore_target=%s restored=%s)",
+        model_name,
         be_id,
         slot_id,
         is_big,
         restore_key[:16] if restore_key else None,
         restored,
-        backend_model_id,
     )
 
     try:
@@ -302,7 +280,7 @@ async def chat(req: Request):
             if resp.status_code != 200:
                 err_txt = await resp.aread()
                 await resp.aclose()
-                sm.release(g)
+                sm.release(model_name, be_id, slot_id)
                 return JSONResponse(
                     {"error": err_txt.decode("utf-8", "ignore")},
                     status_code=resp.status_code,
@@ -310,11 +288,12 @@ async def chat(req: Request):
 
             gen = await start_stream_task(
                 resp,
-                g,
+                model_name,
+                be_id,
+                slot_id,
                 key,
                 prefix,
                 blocks,
-                backend_model_id,
                 sm,
             )
 
@@ -335,7 +314,7 @@ async def chat(req: Request):
                 stream=False,
             )
             if not isinstance(out, dict):
-                sm.release(g)
+                sm.release(model_name, be_id, slot_id)
                 return JSONResponse(
                     {"error": "provider non-JSON body"},
                     status_code=502,
@@ -344,7 +323,7 @@ async def chat(req: Request):
             ok = False
             try:
                 if is_big:
-                    ok, _ = await sm.save_after(g, key, backend_model_id)
+                    ok, _ = await sm.save_after(model_name, be_id, slot_id, key, backend_model_id)
                     hs.write_meta(
                         key,
                         prefix,
@@ -353,11 +332,11 @@ async def chat(req: Request):
                         backend_model_id,
                     )
             finally:
-                sm.release(g)
+                sm.release(model_name, be_id, slot_id)
 
             log.info(
-                "json_done g=%s key=%s saved=%s is_big=%s dur_ms=%d",
-                g,
+                "json_done model=%s be=%d slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
+                model_name, be_id, slot_id,
                 key[:16],
                 ok,
                 is_big,
@@ -366,6 +345,7 @@ async def chat(req: Request):
             return JSONResponse(content=out, status_code=200)
 
     except Exception as e:
-        sm.release(g)
-        log.exception("chat_error g=%s key=%s: %s", g, key[:16], e)
+        sm.release(model_name, be_id, slot_id)
+        log.exception("chat_error model=%s be=%d slot=%d key=%s: %s",
+                      model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)

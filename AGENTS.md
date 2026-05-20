@@ -18,7 +18,14 @@ uvicorn app:app --host 0.0.0.0 --port 8081
 .\run-proxycache.ps1          # gitignored — local config only
 ```
 
-**No tests, no linter, no typechecker.**
+**No linter, no typechecker.**
+
+## Tests
+
+```bash
+# Run smoke tests (no framework required)
+python test_smoke.py
+```
 
 ## Architecture
 
@@ -29,7 +36,7 @@ uvicorn app:app --host 0.0.0.0 --port 8081
 | `config.py` | All config via env vars (no .env file) |
 | `hashing.py` | Text → word-block hashing, LCP matching, meta I/O, cache cleanup |
 | `llama_client.py` | httpx AsyncClient to llama.cpp; slot save/restore via `/slots/{id}` |
-| `slot_manager.py` | Slot pool: free → oldest (LRU). `acquire_for_request` does optional restore |
+| `slot_manager.py` | Per-model slot pools with lazy discovery + 10s cooldown. `GSlot = (model_name, backend_id, slot_id)`. `acquire_for_request` calls `refresh_slots()` internally. |
 | `kv_meta/` | Per-cache `.meta.json` files (prefix blocks, model_id, timestamps) |
 
 ## Config (env vars only)
@@ -51,7 +58,7 @@ uvicorn app:app --host 0.0.0.0 --port 8081
 - **Slot acquire timeout**: 300s hardcoded (`app.py:43`). Returns 503 if all slots busy.
 - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The `reader`'s `finally` block always calls `save_after` + `write_meta` + `release`.
 - **Meta reconciliation**: on startup and during cleanup, orphaned/corrupted `.meta.json` files are deleted.
-- **Slot auto-discovery**: slot count queried from `GET /slots` on startup and every 60s. Falls back to 1 slot if unavailable.
+- **Slot auto-discovery**: slot counts discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode), with a 10s cooldown per (model, backend) pair. Falls back to 1 slot if discovery fails. No startup discovery or periodic refresh.
 - **Cache cleanup**: runs after every 5 saves (min 10 min apart), not on a timer. Uses in-memory ring buffer to track total cache size.
 - **Fork of** `airnsk/proxycache` with llama-swap compatibility and auto cleanup.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, and `run-proxycache.ps1` (local dev script, not tracked).

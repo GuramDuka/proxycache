@@ -14,6 +14,8 @@ OpenAI-compatible proxy for `llama.cpp` that manages KV cache slots with disk sa
 
 - **Disk persistence** — calls `llama.cpp`'s `/slots/{id}?action=save|restore` to persist KV state to disk so caches survive restarts and idle periods.
 - **Configurable prefix matching** — `llama.cpp`'s 50% similarity threshold is hardcoded. proxycache uses tunable `LCP_TH` and scans `.meta.json` files on disk, so it can match against any previously cached prompt — not just ones currently held in active slots.
+- **Per-model slot pools** — slots are keyed by model name, not backend. Each model gets its own pool with independent LRU tracking. Multiple backends can serve the same model.
+- **Router mode support** — when `llama.cpp` runs in router mode (`--models-preset`), slot counts are discovered via `GET /models` + child `/slots` endpoints. Falls back to `GET /slots` for non-router mode.
 - **Smart slot assignment** — picks an unused slot first, then falls back to least-recently-used, protecting cached contexts from accidental overwrites.
 - **Automatic cleanup** — after every 5 cache saves (min 10 min apart), deletes old/expired cache files and reconciles orphaned metadata. `llama.cpp` has no cache eviction.
 - **Multi-backend routing** — supports multiple backends and `llama-swap` mode for model routing. `llama.cpp` is a single server.
@@ -57,9 +59,8 @@ All config via environment variables (defaults in `config.py`):
 | `CACHE_DIR` | — | `llama.cpp` `--slot-save-path` dir (required for cleanup) |
 | `CACHE_MAX_AGE_HOURS` | `168` | Delete files older than this (0=disabled) |
 | `CACHE_MAX_SIZE_GB` | `25` | Max total cache size |
-| `SLOTS_REFRESH_INTERVAL_SECONDS` | `60` | Slot count auto-refresh interval |
 
-Slot count is auto-detected from `GET /slots` on startup and periodically. Falls back to 1 slot if the endpoint is unavailable.
+Slot counts are discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode), with a 10s cooldown per (model, backend) pair. Falls back to 1 slot if discovery fails.
 
 ## llama-swap setup
 
