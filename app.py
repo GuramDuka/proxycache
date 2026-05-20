@@ -18,21 +18,25 @@ Simple KV Proxy (бронебойный):
     * в своём finally reader всегда делает save_after + write_meta + release(g),
       и кладёт в очередь sentinel None;
     * StreamingResponse читает из очереди и никак не влияет на release слота.
+- Slot count auto-discovered from GET /slots on startup and periodically.
+- Cache cleanup runs after every 5 saves (min 10 min apart).
 """
 
 import asyncio
+import os
 import time
 import logging
 from typing import List, Dict, AsyncGenerator, Optional
 
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, 
                     LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB, 
-                    CACHE_CLEANUP_INTERVAL_MINUTES)
+                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
+                    SLOTS_REFRESH_INTERVAL_SECONDS)
                     
 import hashing as hs
 from llama_client import LlamaClient
@@ -45,40 +49,71 @@ STREAM_QUEUE_SIZE = 16
 
 app = FastAPI(title="Simple KV Proxy")
 
-async def periodic_cleanup():
-    """Run cache cleanup periodically."""
-    import hashing as hs
+
+def _slot_refresh_worker(clients):
+    """Runs in a real OS thread to avoid blocking the asyncio event loop."""
+    import time
     while True:
-        try:
-            await asyncio.sleep(CACHE_CLEANUP_INTERVAL_MINUTES * 60)
-            log.info("cleanup_start: max_age=%dh max_size=%.1fGB", 
-                     CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
-            hs.cleanup_old_cache(CACHE_DIR, META_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
-        except Exception as e:
-            log.error("cleanup_error: %s", e)
+        time.sleep(SLOTS_REFRESH_INTERVAL_SECONDS)
+        for i, client in enumerate(clients):
+            try:
+                count = client.get_slot_count()
+                log.debug("slot_refresh be=%d count=%d", i, count)
+            except Exception as e:
+                log.warning("slot_refresh_be%d_error: %s", i, e)
+
+
+async def _periodic_slots_refresh(executor, clients):
+    loop = asyncio.get_running_loop()
+    while True:
+        await loop.run_in_executor(executor, _slot_refresh_worker, clients)
+
 
 @app.on_event("startup")
 async def startup():
     clients = [LlamaClient(be["url"]) for be in BACKENDS]
-    sm = SlotManager()
+
+    # Auto-discover slot counts
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=2)
+    discovered_slots = {}
+    for be_id, be in enumerate(BACKENDS):
+        count = await loop.run_in_executor(executor, clients[be_id].get_slot_count)
+        discovered_slots[be_id] = count
+
+    sm = SlotManager(discovered_slots)
     sm.set_clients(clients)
+    sm.init_from_disk(CACHE_DIR)
+
     app.state.clients = clients
     app.state.sm = sm
-    log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
-    
+    app.state.executor = executor
+    log.info("app_start n_backends=%d slots=%s port=%d",
+             len(BACKENDS), discovered_slots, PORT)
+
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
     reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR)
     if reconciled > 0:
         log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
-    
-    if CACHE_DIR:
-        asyncio.create_task(periodic_cleanup())
+
+    # Log startup sanity summary
+    if CACHE_DIR and os.path.isdir(CACHE_DIR):
+        cache_files = len(os.listdir(CACHE_DIR))
+        log.info("startup_sanity: %d meta files after reconcile, %d cache files on disk",
+                 len(hs.scan_all_meta()), cache_files)
+
+    # Periodic slot refresh in a real OS thread (not asyncio)
+    loop.create_task(_periodic_slots_refresh(executor, clients))
+
 
 @app.on_event("shutdown")
 async def shutdown():
     clients: List[LlamaClient] = getattr(app.state, "clients", [])
+    executor = getattr(app.state, "executor", None)
     if clients:
         await asyncio.gather(*(c.close() for c in clients))
+    if executor:
+        executor.shutdown(wait=False)
 
 
 @app.get("/v1/models")
@@ -121,7 +156,7 @@ async def start_stream_task(
                 pass
             ok = False
             try:
-                ok = await sm.save_after(g, key, model_id)
+                ok, _ = await sm.save_after(g, key, model_id)
             except asyncio.CancelledError:
                 log.warning("save_after_cancelled g=%s key=%s", g, key[:16])
             except Exception as e:
@@ -309,7 +344,7 @@ async def chat(req: Request):
             ok = False
             try:
                 if is_big:
-                    ok = await sm.save_after(g, key, backend_model_id)
+                    ok, _ = await sm.save_after(g, key, backend_model_id)
                     hs.write_meta(
                         key,
                         prefix,

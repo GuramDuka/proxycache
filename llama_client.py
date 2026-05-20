@@ -113,7 +113,7 @@ class LlamaClient:
                 "raw": raw[:2048],
             }
 
-    async def save_slot(self, slot_id: int, basename: str, model_id: str = None) -> bool:
+    async def save_slot(self, slot_id: int, basename: str, model_id: str = None) -> Tuple[bool, int]:
         # JSON body: {"filename": "..."} — иначе 500 на некоторых сборках
         if BACKEND_MODE == "llama-swap" and model_id:
             path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
@@ -132,10 +132,15 @@ class LlamaClient:
                 slot_id,
                 basename[:16],
             )
-            return False
+            return False, 0
 
         resp.raise_for_status()
-        return True
+        try:
+            data = resp.json()
+            n_written = data.get("n_written", 0)
+        except Exception:
+            n_written = 0
+        return True, n_written
 
     async def restore_slot(self, slot_id: int, basename: str, model_id: str = None) -> bool:
         if BACKEND_MODE == "llama-swap" and model_id:
@@ -181,3 +186,21 @@ class LlamaClient:
         except Exception as e:
             log.warning("get_model_id_fail base_url=%s err=%s", self.base_url, e)
             return "unknown"
+
+    async def get_slots_info(self) -> Optional[list]:
+        """GET /slots — returns list of slot dicts, or None on error."""
+        try:
+            resp = await self.client.get("/slots")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.warning("get_slots_info_fail base_url=%s err=%s", self.base_url, e)
+            return None
+
+    async def get_slot_count(self) -> int:
+        """Returns slot count from GET /slots, fallback to 1."""
+        info = await self.get_slots_info()
+        if info and isinstance(info, list):
+            return len(info)
+        log.warning("get_slot_count_fallback_to_1 base_url=%s", self.base_url)
+        return 1

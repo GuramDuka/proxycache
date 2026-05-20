@@ -3,7 +3,7 @@
 
 """
 Единая конфигурация для simple_proxycache:
-- BACKENDS: [{"url": "...", "n_slots": N}]
+- BACKENDS: [{"url": "..."}]
 - WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS, LCP_TH
 - PORT, REQUEST_TIMEOUT, MODEL_ID
 """
@@ -22,7 +22,6 @@ if BACKENDS_RAW:
 else:
     BACKENDS = [{
         "url": os.getenv("LLAMA_URL", "http://127.0.0.1:8000"),
-        "n_slots": int(os.getenv("N_SLOTS", "2")),
     }]
 
 # Words per block for LCP
@@ -53,8 +52,10 @@ PORT = int(os.getenv("PORT", "8081"))
 # Cache cleanup settings
 CACHE_DIR = os.getenv("CACHE_DIR", "")  # llama.cpp --slot-save-path directory
 CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "168"))  # 7 days default
-CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25")) 
-CACHE_CLEANUP_INTERVAL_MINUTES = int(os.getenv("CACHE_CLEANUP_INTERVAL_MINUTES", "30")) 
+CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25"))
+
+# Slot auto-discovery
+SLOTS_REFRESH_INTERVAL_SECONDS = int(os.getenv("SLOTS_REFRESH_INTERVAL_SECONDS", "60"))
 
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

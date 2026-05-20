@@ -28,6 +28,8 @@ from typing import List, Dict, Optional, Tuple
 
 from config import META_DIR, WORDS_PER_BLOCK
 
+META_SUFFIX = ".meta.json"
+
 log = logging.getLogger(__name__)
 
 
@@ -78,7 +80,7 @@ def prefix_key_sha256(text: str) -> str:
 
 def scan_all_meta() -> List[Dict]:
     files = sorted(
-        glob.glob(os.path.join(META_DIR, "*.meta.json")),
+        glob.glob(os.path.join(META_DIR, "*" + META_SUFFIX)),
         key=os.path.getmtime,
         reverse=True,
     )
@@ -152,7 +154,7 @@ def write_meta(
         "blocks": blocks,
         "last_written": time.time(),
     }
-    path = os.path.join(META_DIR, f"{key}.meta.json")
+    path = os.path.join(META_DIR, f"{key}{META_SUFFIX}")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
     log.info("Saved cache for key %s (model: %s, %d blocks)", key[:16], model_id, len(blocks))
@@ -163,7 +165,7 @@ def update_last_read(key: str) -> bool:
     Updates the last_read timestamp in the meta file for a given key.
     Returns True on success, False if the file is missing or corrupted.
     """
-    path = os.path.join(META_DIR, f"{key}.meta.json")
+    path = os.path.join(META_DIR, f"{key}{META_SUFFIX}")
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
@@ -191,13 +193,13 @@ def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
     Returns the count of files deleted.
     """
     deleted = 0
-    meta_files = sorted(glob.glob(os.path.join(meta_dir, "*.meta.json")))
+    meta_files = sorted(      glob.glob(os.path.join(meta_dir, "*" + META_SUFFIX)))
 
     for meta_path in meta_files:
         basename = os.path.basename(meta_path);
         #log.info("Checking meta file: %s", basename)
         
-        cachename = basename.removesuffix(".meta.json")
+        cachename = basename.removesuffix(META_SUFFIX)
         #log.info("Cache filename: %s", cachename)
 
         # Check for corrupted meta files
@@ -232,7 +234,7 @@ def touch_meta(key: str) -> None:
     """
     Обновляет timestamp в существующем meta-файле key.meta.json.
     """
-    path = os.path.join(META_DIR, f"{key}.meta.json")
+    path = os.path.join(META_DIR, f"{key}{META_SUFFIX}")
     try:
         with open(path, "r+", encoding="utf-8") as f:
             try:
@@ -255,7 +257,7 @@ def _get_last_used_time(basename: str, meta_dir: str, cache_dir: str) -> float:
     Determines the last-used timestamp for a cache file.
     Priority: last_read -> last_written -> timestamp -> mtime (filesystem fallback).
     """
-    meta_path = os.path.join(meta_dir, f"{basename}.meta.json")
+    meta_path = os.path.join(meta_dir, f"{basename}{META_SUFFIX}")
     
     # Try to load from meta file
     if os.path.exists(meta_path):
@@ -333,7 +335,7 @@ def cleanup_old_cache(
                 stats["total_freed_bytes"] += cf["size"]
                 cache_files.remove(cf)
                 # Also remove meta file
-                meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
+                meta_path = os.path.join(meta_dir, f"{cf['basename']}{META_SUFFIX}")
                 if os.path.exists(meta_path):
                     os.remove(meta_path)
                 log.info("Deleted cache %s (age: %.1f hours, last used: %s)", 
@@ -357,7 +359,7 @@ def cleanup_old_cache(
                 stats["total_freed_bytes"] += cf["size"]
                 total_size -= cf["size"]
                 # Also remove meta file
-                meta_path = os.path.join(meta_dir, f"{cf['basename']}.meta.json")
+                meta_path = os.path.join(meta_dir, f"{cf['basename']}{META_SUFFIX}")
                 if os.path.exists(meta_path):
                     os.remove(meta_path)
                 log.info("Deleted cache %s (freed: %.1f MB, last used: %s)", 

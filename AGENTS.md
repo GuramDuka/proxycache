@@ -36,7 +36,7 @@ uvicorn app:app --host 0.0.0.0 --port 8081
 
 `config.py` has all defaults. Full table in `README.md`. Key relationships:
 
-- `BACKENDS` (JSON array) **overrides** `LLAMA_URL` + `N_SLOTS` when set
+- `BACKENDS` (JSON array `[{"url":"..."}]`) — multi-backend support
 - `BACKEND_MODE` = `"llama-cpp"` (default) or `"llama-swap"` — changes `/slots` URL paths
 - `CACHE_DIR` must point to llama.cpp's `--slot-save-path` for cleanup to work
 
@@ -51,5 +51,7 @@ uvicorn app:app --host 0.0.0.0 --port 8081
 - **Slot acquire timeout**: 300s hardcoded (`app.py:43`). Returns 503 if all slots busy.
 - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The `reader`'s `finally` block always calls `save_after` + `write_meta` + `release`.
 - **Meta reconciliation**: on startup and during cleanup, orphaned/corrupted `.meta.json` files are deleted.
+- **Slot auto-discovery**: slot count queried from `GET /slots` on startup and every 60s. Falls back to 1 slot if unavailable.
+- **Cache cleanup**: runs after every 5 saves (min 10 min apart), not on a timer. Uses in-memory ring buffer to track total cache size.
 - **Fork of** `airnsk/proxycache` with llama-swap compatibility and auto cleanup.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, and `run-proxycache.ps1` (local dev script, not tracked).
