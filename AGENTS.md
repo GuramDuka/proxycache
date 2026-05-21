@@ -34,7 +34,7 @@ python test_smoke.py
 | `proxycache.py` | 13-line uvicorn wrapper — **not** where main logic lives |
 | `app.py` | FastAPI app, routes (`/v1/chat/completions`, `/v1/models`), streaming pipeline |
 | `config.py` | All config via env vars (no .env file) |
-| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O, cache cleanup |
+| `hashing.py` | Text → word-block hashing, LCP matching, meta I/O (`reconcile_meta`, `_get_last_used_time`) |
 | `llama_client.py` | httpx AsyncClient to llama.cpp; slot save/restore via `/slots/{id}` |
 | `slot_manager.py` | Per-model slot pools with lazy discovery + 10s cooldown. `GSlot = (model_name, backend_id, slot_id)`. `acquire_for_request` calls `refresh_slots()` internally. |
 | `kv_meta/` | Per-cache `.meta.json` files (prefix blocks, model_id, timestamps) |
@@ -57,8 +57,8 @@ python test_smoke.py
 - **Save happens after response** completes (both stream and non-stream), never before.
 - **Slot acquire timeout**: 300s hardcoded (`app.py:43`). Returns 503 if all slots busy.
 - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The `reader`'s `finally` block always calls `save_after` + `write_meta` + `release`.
-- **Meta reconciliation**: on startup and during cleanup, orphaned/corrupted `.meta.json` files are deleted.
+- **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
+- **Cache eviction**: ring buffer in `SlotManager` evicts expired entries (age-first) then LRU entries when `_total_bytes > CACHE_MAX_SIZE_GB`. Eviction only triggers on saves; old entries accumulate if no saves happen. `cleanup_old_cache()` and `update_last_read()` have been removed.
 - **Slot auto-discovery**: slot counts discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode), with a 10s cooldown per (model, backend) pair. Falls back to 1 slot if discovery fails. No startup discovery or periodic refresh.
-- **Cache cleanup**: runs after every 5 saves (min 10 min apart), not on a timer. Uses in-memory ring buffer to track total cache size.
 - **Fork of** `airnsk/proxycache` with llama-swap compatibility and auto cleanup.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, and `run-proxycache.ps1` (local dev script, not tracked).

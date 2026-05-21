@@ -9,8 +9,7 @@ SlotManager: per-model slot pools with lazy discovery and refresh cooldown.
 - refresh_slots() called inside acquire_for_request() with per-(model, backend) cooldown.
 - Router mode: discovers slot counts via GET /models + child /slots.
 - Non-router mode: uses GET /slots as before.
-- Ring buffer: tracks cache size in memory, evicts old files when over limit.
-- Cleanup: triggered after every 5 saves (min 10 min apart).
+- Ring buffer: tracks cache size in memory, evicts expired entries first, then LRU.
 """
 
 import os
@@ -28,8 +27,6 @@ log = logging.getLogger(__name__)
 
 GSlot = Tuple[str, int, int]  # (model_name, backend_id, slot_id)
 
-CACHE_CLEANUP_SAVE_INTERVAL = 5
-CACHE_CLEANUP_MIN_INTERVAL_SECONDS = 600
 REFRESH_COOLDOWN_SECONDS = 300
 
 
@@ -43,14 +40,12 @@ class SlotManager:
         self._last_refresh: Dict[Tuple[str, int], float] = {}
 
         # Ring buffer for cache size tracking
-        self._cache_ring: deque = deque()  # (key, size_bytes)
+        self._cache_ring: deque = deque()  # (key, size_bytes, last_used_time)
         self._total_bytes: int = 0
+        self._max_age_seconds: float = CACHE_MAX_AGE_HOURS * 3600
 
-        # Save-triggered cleanup tracking
-        self._save_count: int = 0
-        self._last_cleanup_time: float = 0.0
-
-        log.info("slot_manager n_backends=%d", len(self.backends))
+        log.info("slot_manager n_backends=%d max_age_hours=%d",
+                 len(self.backends), CACHE_MAX_AGE_HOURS)
 
     def set_clients(self, clients: List):
         self.backends = []
@@ -67,12 +62,13 @@ class SlotManager:
             if os.path.isfile(filepath):
                 try:
                     size = os.stat(filepath).st_size
-                    self._cache_ring.append((f, size))
+                    last_used = hs._get_last_used_time(f, META_DIR, cache_dir)
+                    self._cache_ring.append((f, size, last_used))
                     self._total_bytes += size
                 except OSError:
                     continue
         log.info("init_from_disk: %d cache files, %.1f GB total",
-                 len(self._cache_ring), self._total_bytes / 1024**3)
+                  len(self._cache_ring), self._total_bytes / 1024**3)
 
     def _is_free(self, model_name: str, backend_id: int, slot_id: int) -> bool:
         return self._last_used.get((model_name, backend_id, slot_id), 0.0) == 0.0
@@ -288,7 +284,7 @@ class SlotManager:
                 model_name, backend_id, slot_id, restored,
             )
             if restored:
-                hs.update_last_read(restore_key)
+                self._touch_ring(restore_key)
 
         return (model_name_out, backend_id, slot_id), lock, restored
 
@@ -304,40 +300,64 @@ class SlotManager:
         ok, size = await client.save_slot(slot_id, key, model_id)
 
         if ok and size > 0:
-            self._cache_ring.append((key, size))
+            self._cache_ring.append((key, size, time.time()))
             self._total_bytes += size
 
-            # Ring buffer eviction
+            # Ring buffer eviction: age-first, then LRU
             max_bytes = CACHE_MAX_SIZE_GB * 1024**3
+            now = time.time()
             while self._total_bytes > max_bytes and self._cache_ring:
-                old_key, old_size = self._cache_ring.popleft()
-                self._total_bytes -= old_size
-                cache_path = os.path.join(CACHE_DIR, old_key) if CACHE_DIR else None
+                # First pass: evict expired entries
+                evicted_expired = False
+                for entry in self._cache_ring:
+                    if now - entry[2] > self._max_age_seconds:
+                        evict_key, evict_size, _ = entry
+                        self._cache_ring.remove(entry)
+                        self._total_bytes -= evict_size
+                        cache_path = os.path.join(CACHE_DIR, evict_key) if CACHE_DIR else None
+                        if cache_path and os.path.exists(cache_path):
+                            try:
+                                os.remove(cache_path)
+                                log.info("ring_evict_expired: %s (%d bytes, age=%.1fh)",
+                                         evict_key[:16], evict_size,
+                                         (now - entry[2]) / 3600)
+                            except OSError:
+                                pass
+                        meta_path = os.path.join(META_DIR, f"{evict_key}{hs.META_SUFFIX}")
+                        if os.path.exists(meta_path):
+                            try:
+                                os.remove(meta_path)
+                            except OSError:
+                                pass
+                        evicted_expired = True
+                        break
+                if evicted_expired:
+                    continue
+
+                # Second pass: evict LRU entry (no expired entries left)
+                lru_idx = 0
+                lru_ts = self._cache_ring[0][2]
+                for i in range(1, len(self._cache_ring)):
+                    if self._cache_ring[i][2] < lru_ts:
+                        lru_ts = self._cache_ring[i][2]
+                        lru_idx = i
+                evict_key, evict_size, _ = self._cache_ring[lru_idx]
+                self._cache_ring.remove(self._cache_ring[lru_idx])
+                self._total_bytes -= evict_size
+                cache_path = os.path.join(CACHE_DIR, evict_key) if CACHE_DIR else None
                 if cache_path and os.path.exists(cache_path):
                     try:
                         os.remove(cache_path)
-                        log.info("ring_evict: %s (%d bytes)", old_key[:16], old_size)
+                        log.info("ring_evict_lru: %s (%d bytes, last_used=%.0f)",
+                                 evict_key[:16], evict_size, lru_ts)
                     except OSError:
                         pass
-                meta_path = os.path.join(META_DIR, f"{old_key}{hs.META_SUFFIX}")
+                meta_path = os.path.join(META_DIR, f"{evict_key}{hs.META_SUFFIX}")
                 if os.path.exists(meta_path):
                     try:
                         os.remove(meta_path)
                     except OSError:
                         pass
-
-            # Save-triggered cleanup
-            self._save_count += 1
-            now = time.time()
-            if (self._save_count >= CACHE_CLEANUP_SAVE_INTERVAL and
-                    now - self._last_cleanup_time >= CACHE_CLEANUP_MIN_INTERVAL_SECONDS):
-                self._save_count = 0
-                self._last_cleanup_time = now
-                try:
-                    hs.cleanup_old_cache(CACHE_DIR, META_DIR,
-                                         CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
-                except Exception as e:
-                    log.warning("save_triggered_cleanup_error: %s", e)
 
         return ok, size
 
@@ -347,3 +367,10 @@ class SlotManager:
         if lock and lock.locked():
             lock.release()
             self._last_used[g] = 0.0
+
+    def _touch_ring(self, key: str):
+        """Update the last_used timestamp for a cache entry in the ring buffer."""
+        for i in range(len(self._cache_ring)):
+            if self._cache_ring[i][0] == key:
+                self._cache_ring[i] = (key, self._cache_ring[i][1], time.time())
+                break

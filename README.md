@@ -17,7 +17,7 @@ OpenAI-compatible proxy for `llama.cpp` that manages KV cache slots with disk sa
 - **Per-model slot pools** — slots are keyed by model name, not backend. Each model gets its own pool with independent LRU tracking. Multiple backends can serve the same model.
 - **Router mode support** — when `llama.cpp` runs in router mode (`--models-preset`), slot counts are discovered via `GET /models` + child `/slots` endpoints. Falls back to `GET /slots` for non-router mode.
 - **Smart slot assignment** — picks an unused slot first, then falls back to least-recently-used, protecting cached contexts from accidental overwrites.
-- **Automatic cleanup** — after every 5 cache saves (min 10 min apart), deletes old/expired cache files and reconciles orphaned metadata. `llama.cpp` has no cache eviction.
+- **Automatic cleanup** — ring buffer evicts expired entries (age-first) then LRU entries when total cache exceeds `CACHE_MAX_SIZE_GB`. Reconciliation of orphaned/corrupted metadata runs on startup. `llama.cpp` has no cache eviction.
 - **Multi-backend routing** — supports multiple backends and `llama-swap` mode for model routing. `llama.cpp` is a single server.
 
 Small requests (< `BIG_THRESHOLD_WORDS`) skip cache I/O entirely — the overhead of hashing, scanning meta files, and disk reads/writes exceeds any prefill savings on short prompts.

@@ -19,7 +19,7 @@ Simple KV Proxy (бронебойный):
       и кладёт в очередь sentinel None;
     * StreamingResponse читает из очереди и никак не влияет на release слота.
 - Slot pools are per-model with lazy discovery + refresh cooldown.
-- Cache cleanup runs after every 5 saves (min 10 min apart).
+- Cache eviction via ring buffer in SlotManager (age-first, then LRU).
 """
 
 import asyncio

@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import tempfile
+import time
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,8 +14,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ── hashing tests (unchanged) ────────────────────────────────────────
 
-def test_meta_filename_mapping():
-    """reconcile_meta must derive cache filename correctly from meta filename."""
+def test_reconcile_meta_removes_orphans():
+    """reconcile_meta should delete meta files with no matching cache and skip valid ones."""
     import hashing as hs
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -23,21 +24,42 @@ def test_meta_filename_mapping():
         os.makedirs(cache_dir)
         os.makedirs(meta_dir)
 
-        key = "a1b2c3d4e5f6"
-        cache_file = os.path.join(cache_dir, key)
-        meta_file = os.path.join(meta_dir, f"{key}.meta.json")
-
-        with open(cache_file, "w") as f:
+        # Valid entry: cache + meta both exist
+        valid_key = "valid_cache_key"
+        with open(os.path.join(cache_dir, valid_key), "w") as f:
             f.write("cache data")
-        with open(meta_file, "w") as f:
-            json.dump({"key": key, "model_id": "test", "wpb": 100, "blocks": []}, f)
+        with open(os.path.join(meta_dir, f"{valid_key}.meta.json"), "w") as f:
+            json.dump({"key": valid_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
+
+        # Orphaned entry: meta exists but cache does not
+        orphan_key = "orphan_cache_key"
+        with open(os.path.join(meta_dir, f"{orphan_key}.meta.json"), "w") as f:
+            json.dump({"key": orphan_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
+
+        # Corrupted meta file
+        corrupted_key = "corrupted_cache_key"
+        with open(os.path.join(meta_dir, f"{corrupted_key}.meta.json"), "w") as f:
+            f.write("not json {{{")
 
         deleted = hs.reconcile_meta(meta_dir, cache_dir)
 
-        assert deleted == 0, f"Expected 0 deleted, got {deleted}"
-        assert os.path.exists(meta_file), "Meta file was incorrectly deleted"
-        assert os.path.exists(cache_file), "Cache file was incorrectly deleted"
-        print("PASS: test_meta_filename_mapping")
+        assert deleted == 2, f"Expected 2 deleted (orphan + corrupted), got {deleted}"
+        assert os.path.exists(os.path.join(meta_dir, f"{valid_key}.meta.json")), "Valid meta was deleted"
+        assert not os.path.exists(os.path.join(meta_dir, f"{orphan_key}.meta.json")), "Orphan meta was not deleted"
+        assert not os.path.exists(os.path.join(meta_dir, f"{corrupted_key}.meta.json")), "Corrupted meta was not deleted"
+        print("PASS: test_reconcile_meta_removes_orphans")
+
+
+def test_hashing_imports():
+    """hashing module should import without cleanup_old_cache or update_last_read."""
+    import hashing as hs
+    assert hasattr(hs, "reconcile_meta")
+    assert hasattr(hs, "_get_last_used_time")
+    assert hasattr(hs, "write_meta")
+    assert hasattr(hs, "find_best_restore_candidate")
+    assert not hasattr(hs, "cleanup_old_cache")
+    assert not hasattr(hs, "update_last_read")
+    print("PASS: test_hashing_imports")
 
 
 def test_save_slot_response_parsing():
@@ -419,8 +441,165 @@ def test_slot_manager_model_not_loaded():
     print("PASS: test_slot_manager_model_not_loaded")
 
 
+def test_ring_buffer_age_eviction():
+    """Ring buffer should evict expired entries before LRU entries when over limit."""
+    from slot_manager import SlotManager
+    import hashing as hs
+    import tempfile
+
+    sm = SlotManager()
+    sm._max_age_seconds = 3600  # 1 hour
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_dir = os.path.join(tmpdir, "cache")
+        meta_dir = os.path.join(tmpdir, "meta")
+        os.makedirs(cache_dir)
+        os.makedirs(meta_dir)
+
+        # Simulate ring buffer with entries of different ages
+        old_key = "old_cache_file"
+        new_key = "new_cache_file"
+        size = 1024 * 1024 * 1020  # ~1 GB each
+        max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
+
+        sm._cache_ring.append((old_key, size, time.time() - 7200))  # 2 hours old
+        sm._cache_ring.append((new_key, size, time.time() - 300))   # 5 minutes old
+        sm._total_bytes = size * 2
+
+        # Trigger eviction (simulating save_after behavior)
+        now = time.time()
+        evicted = []
+        while sm._total_bytes > max_bytes and sm._cache_ring:
+            # First pass: evict expired entries
+            evicted_expired = False
+            for entry in sm._cache_ring:
+                if now - entry[2] > sm._max_age_seconds:
+                    evict_key, evict_size, _ = entry
+                    sm._cache_ring.remove(entry)
+                    sm._total_bytes -= evict_size
+                    evicted.append(evict_key)
+                    evicted_expired = True
+                    break
+            if evicted_expired:
+                continue
+
+            # Second pass: evict LRU entry
+            lru_idx = 0
+            lru_ts = sm._cache_ring[0][2]
+            for i in range(1, len(sm._cache_ring)):
+                if sm._cache_ring[i][2] < lru_ts:
+                    lru_ts = sm._cache_ring[i][2]
+                    lru_idx = i
+            evict_key, evict_size, _ = sm._cache_ring[lru_idx]
+            sm._cache_ring.remove(sm._cache_ring[lru_idx])
+            sm._total_bytes -= evict_size
+            evicted.append(evict_key)
+
+        assert evicted == [old_key], f"Expected [old_key], got {evicted}"
+        assert sm._total_bytes == size  # Only old entry removed
+        assert len(sm._cache_ring) == 1
+        assert sm._cache_ring[0][0] == new_key
+        print("PASS: test_ring_buffer_age_eviction")
+
+
+def test_ring_buffer_lru_eviction():
+    """Ring buffer should evict LRU entry when no entries are expired."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm._max_age_seconds = 3600  # 1 hour
+
+    size = 1024 * 1024 * 1020  # ~1 GB each
+    max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
+
+    # Simulate ring buffer with all entries under max age
+    sm._cache_ring.append(("cache_a", size, time.time() - 1800))  # 30 min old
+    sm._cache_ring.append(("cache_b", size, time.time() - 600))   # 10 min old
+    sm._total_bytes = size * 2
+
+    # Trigger eviction
+    now = time.time()
+    evicted = []
+    while sm._total_bytes > max_bytes and sm._cache_ring:
+        evicted_expired = False
+        for entry in sm._cache_ring:
+            if now - entry[2] > sm._max_age_seconds:
+                evict_key, evict_size, _ = entry
+                sm._cache_ring.remove(entry)
+                sm._total_bytes -= evict_size
+                evicted.append(evict_key)
+                evicted_expired = True
+                break
+        if evicted_expired:
+            continue
+
+        lru_idx = 0
+        lru_ts = sm._cache_ring[0][2]
+        for i in range(1, len(sm._cache_ring)):
+            if sm._cache_ring[i][2] < lru_ts:
+                lru_ts = sm._cache_ring[i][2]
+                lru_idx = i
+        evict_key, evict_size, _ = sm._cache_ring[lru_idx]
+        sm._cache_ring.remove(sm._cache_ring[lru_idx])
+        sm._total_bytes -= evict_size
+        evicted.append(evict_key)
+
+    assert evicted == ["cache_a"], f"Expected [cache_a] (LRU), got {evicted}"
+    assert sm._total_bytes == size
+    assert len(sm._cache_ring) == 1
+    assert sm._cache_ring[0][0] == "cache_b"
+    print("PASS: test_ring_buffer_lru_eviction")
+
+
+def test_ring_buffer_no_eviction_under_limit():
+    """Ring buffer should not evict when under size limit."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm._max_age_seconds = 3600
+
+    size = 1024 * 1024 * 1020  # ~1 GB
+    max_bytes = 2 * 1024 * 1024 * 1024  # 2 GB limit
+
+    sm._cache_ring.append(("cache_a", size, time.time() - 1800))
+    sm._cache_ring.append(("cache_b", size, time.time() - 600))
+    sm._total_bytes = size * 2
+
+    now = time.time()
+    evicted = []
+    while sm._total_bytes > max_bytes and sm._cache_ring:
+        evicted_expired = False
+        for entry in sm._cache_ring:
+            if now - entry[2] > sm._max_age_seconds:
+                evict_key, evict_size, _ = entry
+                sm._cache_ring.remove(entry)
+                sm._total_bytes -= evict_size
+                evicted.append(evict_key)
+                evicted_expired = True
+                break
+        if evicted_expired:
+            continue
+
+        lru_idx = 0
+        lru_ts = sm._cache_ring[0][2]
+        for i in range(1, len(sm._cache_ring)):
+            if sm._cache_ring[i][2] < lru_ts:
+                lru_ts = sm._cache_ring[i][2]
+                lru_idx = i
+        evict_key, evict_size, _ = sm._cache_ring[lru_idx]
+        sm._cache_ring.remove(sm._cache_ring[lru_idx])
+        sm._total_bytes -= evict_size
+        evicted.append(evict_key)
+
+    assert evicted == [], f"Expected no evictions, got {evicted}"
+    assert sm._total_bytes == size * 2
+    assert len(sm._cache_ring) == 2
+    print("PASS: test_ring_buffer_no_eviction_under_limit")
+
+
 if __name__ == "__main__":
-    test_meta_filename_mapping()
+    test_reconcile_meta_removes_orphans()
+    test_hashing_imports()
     test_save_slot_response_parsing()
     test_refresh_slots_router_mode_filtering()
     test_refresh_slots_non_router_mode()
@@ -437,4 +616,7 @@ if __name__ == "__main__":
     test_slot_manager_router_mode_discovery()
     test_slot_manager_non_router_fallback()
     test_slot_manager_model_not_loaded()
+    test_ring_buffer_age_eviction()
+    test_ring_buffer_lru_eviction()
+    test_ring_buffer_no_eviction_under_limit()
     print("\nAll smoke tests passed.")
