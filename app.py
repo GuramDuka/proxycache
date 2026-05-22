@@ -43,7 +43,7 @@ from slot_manager import SlotManager, GSlot
 
 log = logging.getLogger(__name__)
 
-ACQUIRE_TIMEOUT = 300.0
+ACQUIRE_TIMEOUT = 60.0
 STREAM_QUEUE_SIZE = 16
 
 app = FastAPI(title="Simple KV Proxy")

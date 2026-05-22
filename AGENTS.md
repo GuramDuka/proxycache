@@ -33,10 +33,12 @@ python test_smoke.py                          # smoke tests (no framework, uses 
 - **Slot pinning** is duplicated 3 ways in every request body: root (`slot_id`, `id_slot`, `_slot_id`), `options` dict, and query params.
 - **Save happens after response** completes (both stream and non-stream), never before.
 - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The reader's `finally` block always calls `save_after` + `write_meta` + `release`.
-- **Slot acquire timeout**: 300s hardcoded (`app.py:46`). Returns 503 if all slots busy.
+- **Slot acquire timeout**: 60s hardcoded (`app.py:46`). Returns 503 if all slots busy.
+- **Slot timeout**: `SLOT_TIMEOUT` (default 30s) wraps `/slots/{id}?action=save|restore` calls. Separate from `REQUEST_TIMEOUT` (600s) so slot operations fail fast on dead backends instead of blocking for 10min.
+- **Adaptive cooldown**: after a failed `refresh_slots()`, slot discovery retries every 30s instead of 300s, so requests recover faster when the backend comes back up.
 - **Small requests** (`< BIG_THRESHOLD_WORDS`, default 500 words) skip cache save/restore entirely — routed to free/oldest slot with no disk I/O.
 - **KV cache skip**: `acquire_for_request` checks `_slot_kv_state` before restoring. If the slot's tracked KV cache blocks have LCP ratio >= `KV_CACHE_SKIP_THRESHOLD` (default 0.9), the restore is skipped — llama.cpp appends to existing cache. State updates after every save (from `blocks` param) and after every restore (from meta file).
 - **Ring buffer eviction**: `SlotManager` evicts expired entries (age-first) then LRU when `_total_bytes > CACHE_MAX_SIZE_GB`. Eviction only triggers on saves; stale entries accumulate if no saves happen.
-- **Slot refresh cooldown**: 300s per (model, backend) pair. No startup discovery or periodic refresh — slots discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
+- **Slot refresh cooldown**: 300s per (model, backend) pair on success, 30s on failure. No startup discovery or periodic refresh — slots discovered on-demand via `GET /slots` (non-router) or `GET /models` + child `/slots` (router mode). Falls back to 1 slot if discovery fails.
 - **Meta reconciliation**: on startup, orphaned/corrupted `.meta.json` files are deleted via `reconcile_meta()`.
 - `.gitignore` covers `kv_meta/`, `venv/`, `__pycache__/`, and `run-proxycache.ps1`.

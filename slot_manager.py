@@ -21,7 +21,8 @@ from collections import deque
 from typing import List, Tuple, Dict, Optional
 
 from config import (BACKENDS, META_DIR, CACHE_DIR, CACHE_MAX_AGE_HOURS,
-                    CACHE_MAX_SIZE_GB, KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK)
+                    CACHE_MAX_SIZE_GB, KV_CACHE_SKIP_THRESHOLD, LCP_TH, WORDS_PER_BLOCK,
+                    SLOT_TIMEOUT)
 import hashing as hs
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class SlotManager:
         self._slot_pools: Dict[str, Dict[int, set]] = {}
         self._last_used: Dict[Tuple[str, int, int], float] = {}
         self._locks: Dict[Tuple[str, int, int], asyncio.Lock] = {}
-        self._last_refresh: Dict[Tuple[str, int], float] = {}
+        self._last_refresh: Dict[Tuple[str, int], Tuple[float, bool]] = {}
 
         # Ring buffer for cache size tracking
         self._cache_ring: deque = deque()  # (key, size_bytes, last_used_time)
@@ -205,12 +206,13 @@ class SlotManager:
                 log.debug("refresh_slots_skip_no_client model=%s be=%d", model_name, backend_id)
                 continue
 
-            # Check cooldown
+            # Check cooldown — 30s after failure, 300s after success
             refresh_key = (model_name, backend_id)
             now = time.time()
-            last = self._last_refresh.get(refresh_key, 0.0)
-            if now - last < REFRESH_COOLDOWN_SECONDS:
-                log.debug("refresh_slots_cooldown model=%s be=%d last=%.1f", model_name, backend_id, last)
+            last_ts, last_success = self._last_refresh.get(refresh_key, (0.0, True))
+            cooldown = 30 if not last_success else REFRESH_COOLDOWN_SECONDS
+            if now - last_ts < cooldown:
+                log.debug("refresh_slots_cooldown model=%s be=%d last=%.1f", model_name, backend_id, last_ts)
                 continue
 
             # get_slots_info() handles both router and non-router modes internally
@@ -241,7 +243,7 @@ class SlotManager:
                     )
                 self._register_backend_for_model(model_name, backend_id)
                 self._ensure_pool(model_name, backend_id, n_slots)
-                self._last_refresh[refresh_key] = now
+                self._last_refresh[refresh_key] = (now, True)
                 refreshed_any = True
             else:
                 # Slots unavailable (model not loaded yet or discovery failed)
@@ -251,7 +253,7 @@ class SlotManager:
                 )
                 self._register_backend_for_model(model_name, backend_id)
                 self._ensure_pool(model_name, backend_id, 1)
-                self._last_refresh[refresh_key] = now
+                self._last_refresh[refresh_key] = (now, False)
                 refreshed_any = True
 
         if not refreshed_any:
@@ -295,23 +297,82 @@ class SlotManager:
 
         # Select best backend + slot
         model_name_out, backend_id, slot_id, lock = self._select_from_pool(model_name)
-        await lock.acquire()
+        # Cap lock acquire timeout at 30s — don't let requests hang forever
+        lock_timeout = min(30.0, SLOT_TIMEOUT)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=lock_timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "acquire_lock_timeout model=%s be=%d slot=%d after %ds",
+                model_name, backend_id, slot_id, lock_timeout,
+            )
+            raise
         self._last_used[(model_name_out, backend_id, slot_id)] = time.time()
 
         g = (model_name_out, backend_id, slot_id)
 
         # Restore if needed
         restored: Optional[bool] = None
-        if blocks:
-            # Skip restore if slot's KV cache already matches well
-            if self._should_skip_restore(g, blocks):
-                log.info(
-                    "skip_restore_slot_cached model=%s be=%d slot=%d",
-                    model_name, backend_id, slot_id,
-                )
-                restored = False
+        try:
+            if blocks:
+                # Skip restore if slot's KV cache already matches well
+                if self._should_skip_restore(g, blocks):
+                    log.info(
+                        "skip_restore_slot_cached model=%s be=%d slot=%d",
+                        model_name, backend_id, slot_id,
+                    )
+                    restored = False
+                elif restore_key:
+                    # Restore from pre-computed candidate
+                    client = self.backends[backend_id]["client"]
+                    restored = await client.restore_slot(slot_id, restore_key, model_name)
+                    log.info(
+                        "restore_before_chat model=%s be=%d slot=%d ok=%s",
+                        model_name, backend_id, slot_id, restored,
+                    )
+                    if restored:
+                        self._touch_ring(restore_key)
+                        # Update tracked KV state with restored candidate blocks
+                        try:
+                            meta_path = os.path.join(META_DIR, f"{restore_key}{hs.META_SUFFIX}")
+                            if os.path.exists(meta_path):
+                                with open(meta_path, "r", encoding="utf-8") as mf:
+                                    meta = json.load(mf)
+                                self._slot_kv_state[g] = meta.get("blocks", [])
+                        except Exception as e:
+                            log.warning("restore_meta_load_fail key=%s: %s", restore_key[:16], e)
+                else:
+                    # No pre-computed candidate and KV cache doesn't match —
+                    # find best meta file to restore from
+                    client = self.backends[backend_id]["client"]
+                    cand = hs.find_best_restore_candidate(
+                        blocks, WORDS_PER_BLOCK, LCP_TH, model_name,
+                    )
+                    if cand:
+                        cand_key, cand_ratio = cand
+                        restored = await client.restore_slot(slot_id, cand_key, model_name)
+                        log.info(
+                            "restore_dynamic model=%s be=%d slot=%d key=%s ratio=%.3f ok=%s",
+                            model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
+                        )
+                        if restored:
+                            try:
+                                meta_path = os.path.join(META_DIR, f"{cand_key}{hs.META_SUFFIX}")
+                                if os.path.exists(meta_path):
+                                    with open(meta_path, "r", encoding="utf-8") as mf:
+                                        meta = json.load(mf)
+                                    self._slot_kv_state[g] = meta.get("blocks", [])
+                            except Exception as e:
+                                log.warning("restore_meta_load_fail key=%s: %s", cand_key[:16], e)
+                    else:
+                        log.info(
+                            "restore_dynamic_none model=%s be=%d slot=%d",
+                            model_name, backend_id, slot_id,
+                        )
+                        restored = False
+
             elif restore_key:
-                # Restore from pre-computed candidate
+                # Legacy path: no blocks passed but restore_key provided
                 client = self.backends[backend_id]["client"]
                 restored = await client.restore_slot(slot_id, restore_key, model_name)
                 log.info(
@@ -320,57 +381,13 @@ class SlotManager:
                 )
                 if restored:
                     self._touch_ring(restore_key)
-                    # Update tracked KV state with restored candidate blocks
-                    try:
-                        meta_path = os.path.join(META_DIR, f"{restore_key}{hs.META_SUFFIX}")
-                        if os.path.exists(meta_path):
-                            with open(meta_path, "r", encoding="utf-8") as mf:
-                                meta = json.load(mf)
-                            self._slot_kv_state[g] = meta.get("blocks", [])
-                    except Exception as e:
-                        log.warning("restore_meta_load_fail key=%s: %s", restore_key[:16], e)
-            else:
-                # No pre-computed candidate and KV cache doesn't match —
-                # find best meta file to restore from
-                client = self.backends[backend_id]["client"]
-                cand = hs.find_best_restore_candidate(
-                    blocks, WORDS_PER_BLOCK, LCP_TH, model_name,
-                )
-                if cand:
-                    cand_key, cand_ratio = cand
-                    restored = await client.restore_slot(slot_id, cand_key, model_name)
-                    log.info(
-                        "restore_dynamic model=%s be=%d slot=%d key=%s ratio=%.3f ok=%s",
-                        model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
-                    )
-                    if restored:
-                        try:
-                            meta_path = os.path.join(META_DIR, f"{cand_key}{hs.META_SUFFIX}")
-                            if os.path.exists(meta_path):
-                                with open(meta_path, "r", encoding="utf-8") as mf:
-                                    meta = json.load(mf)
-                                self._slot_kv_state[g] = meta.get("blocks", [])
-                        except Exception as e:
-                            log.warning("restore_meta_load_fail key=%s: %s", cand_key[:16], e)
-                else:
-                    log.info(
-                        "restore_dynamic_none model=%s be=%d slot=%d",
-                        model_name, backend_id, slot_id,
-                    )
-                    restored = False
 
-        elif restore_key:
-            # Legacy path: no blocks passed but restore_key provided
-            client = self.backends[backend_id]["client"]
-            restored = await client.restore_slot(slot_id, restore_key, model_name)
-            log.info(
-                "restore_before_chat model=%s be=%d slot=%d ok=%s",
-                model_name, backend_id, slot_id, restored,
-            )
-            if restored:
-                self._touch_ring(restore_key)
-
-        return g, lock, restored
+            return g, lock, restored
+        except Exception:
+            # Clean up leaked KV state on failure so the slot doesn't get
+            # incorrectly skipped on its next use
+            self._slot_kv_state.pop(g, None)
+            raise
 
     async def save_after(
         self,

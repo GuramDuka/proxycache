@@ -11,12 +11,13 @@ HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots
 - Пин слота дублируется в root/options/query.
 """
 
+import asyncio
 import httpx
 import logging
 from typing import Dict, Optional, Tuple
 from urllib.parse import quote
 
-from config import REQUEST_TIMEOUT, BACKEND_MODE
+from config import REQUEST_TIMEOUT, BACKEND_MODE, SLOT_TIMEOUT
 
 log = logging.getLogger(__name__)
 
@@ -119,11 +120,21 @@ class LlamaClient:
         else:
             path = f"/slots/{slot_id}"
 
-        resp = await self.client.post(
-            path,
-            params={"action": "save"},
-            json={"filename": basename, "model":model_id},
-        )
+        try:
+            resp = await asyncio.wait_for(
+                self.client.post(
+                    path,
+                    params={"action": "save"},
+                    json={"filename": basename, "model": model_id},
+                ),
+                timeout=SLOT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "save_slot_timeout slot=%d basename=%s after %ds",
+                slot_id, basename[:16], SLOT_TIMEOUT,
+            )
+            return False, 0
 
         if resp.status_code == 500:
             log.warning(
@@ -147,11 +158,21 @@ class LlamaClient:
         else:
             path = f"/slots/{slot_id}"
 
-        resp = await self.client.post(
-            path,
-            params={"action": "restore"},
-            json={"filename": basename, "model":model_id},
-        )
+        try:
+            resp = await asyncio.wait_for(
+                self.client.post(
+                    path,
+                    params={"action": "restore"},
+                    json={"filename": basename, "model": model_id},
+                ),
+                timeout=SLOT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "restore_slot_timeout slot=%d basename=%s after %ds",
+                slot_id, basename[:16], SLOT_TIMEOUT,
+            )
+            return False
 
         if resp.status_code != 200:
             log.warning(

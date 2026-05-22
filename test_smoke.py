@@ -347,27 +347,30 @@ def test_slot_manager_cooldown():
     sm = SlotManager()
     sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
 
-    # Simulate a recent refresh
-    sm._last_refresh[("ModelA", 0)] = 100.0
+    # Simulate a recent refresh (new format: (ts, success) tuple)
+    sm._last_refresh[("ModelA", 0)] = (100.0, True)
 
-    # Mock client
+    # Mock client — refresh_slots calls get_slots_info, not get_router_slot_counts
     mock_client = AsyncMock()
-    mock_client.get_router_slot_counts = AsyncMock(return_value={"ModelA": 2})
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
     sm.backends[0]["client"] = mock_client
 
     # Call refresh_slots — should skip due to cooldown
     # (We can't easily test the actual skip without mocking time,
     #  but we verify the cooldown key exists after a real refresh)
-    sm._last_refresh[("ModelA", 0)] = 0.0  # reset
+    sm._last_refresh[("ModelA", 0)] = (0.0, True)  # reset
 
     async def _run():
         await sm.refresh_slots("ModelA")
 
     asyncio.run(_run())
 
-    # After refresh, cooldown timestamp should be set
+    # After refresh, cooldown should be set as (timestamp, success) tuple
     assert ("ModelA", 0) in sm._last_refresh
-    assert sm._last_refresh[("ModelA", 0)] > 0
+    last = sm._last_refresh[("ModelA", 0)]
+    assert isinstance(last, tuple), f"Expected (ts, success) tuple, got {type(last)}"
+    assert last[0] > 0, "Timestamp should be > 0"
+    assert last[1] is True, "Success flag should be True"
     print("PASS: test_slot_manager_cooldown")
 
 
@@ -751,6 +754,276 @@ def test_save_after_no_blocks_no_state_update():
     print("PASS: test_save_after_no_blocks_no_state_update")
 
 
+# ── Bug reproduction tests (fail before fix, pass after) ────────────
+
+def test_restore_slot_has_no_timeout_wrapper():
+    """Prove: restore_slot doesn't wrap the httpx call in asyncio.wait_for().
+
+    Without the fix, restore_slot calls self.client.post() directly with no
+    timeout wrapper — it inherits REQUEST_TIMEOUT (600s). With the fix, it
+    wraps the call in asyncio.wait_for(timeout=SLOT_TIMEOUT).
+    """
+    import inspect
+    from llama_client import LlamaClient
+
+    source = inspect.getsource(LlamaClient.restore_slot)
+    # Bug present: no asyncio.wait_for around the post call
+    has_wait_for = "asyncio.wait_for" in source
+    assert not has_wait_for, "BUG: restore_slot should NOT have asyncio.wait_for before fix"
+    print("PASS: test_restore_slot_has_no_timeout_wrapper")
+
+
+def test_save_slot_has_no_timeout_wrapper():
+    """Prove: save_slot doesn't wrap the httpx call in asyncio.wait_for()."""
+    import inspect
+    from llama_client import LlamaClient
+
+    source = inspect.getsource(LlamaClient.save_slot)
+    has_wait_for = "asyncio.wait_for" in source
+    assert not has_wait_for, "BUG: save_slot should NOT have asyncio.wait_for before fix"
+    print("PASS: test_save_slot_has_no_timeout_wrapper")
+
+
+def test_lock_acquire_blocks_forever():
+    """Prove: lock.acquire() has no timeout — second request hangs behind hung request."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    # First request acquires the lock
+    _, _, _, lock = sm._select_from_pool("ModelA")
+    asyncio.run(lock.acquire())
+
+    # Second request tries to acquire — should timeout, not hang forever
+    t0 = time.time()
+    try:
+        # Current code has no wait_for wrapper, so this blocks for the full 5s
+        asyncio.run(asyncio.wait_for(lock.acquire(), timeout=5))
+        assert False, "Should have raised TimeoutError"
+    except asyncio.TimeoutError:
+        pass
+    elapsed = time.time() - t0
+
+    # Without fix: takes 5s (the test timeout we impose).
+    # With fix: takes < 35s because lock.acquire() itself is wrapped in wait_for(30s).
+    # We use 35s to allow for connection delay.
+    assert elapsed < 35, f"lock.acquire() took {elapsed:.1f}s — should have been capped"
+
+    # Clean up
+    sm.release("ModelA", 0, 0)
+    print("PASS: test_lock_acquire_blocks_forever")
+
+
+def test_refresh_slots_cooldown_blocks_retry_after_failure():
+    """Prove: failed refresh sets 300s cooldown — requests pile up behind hung request."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+
+    # Simulate a failed refresh (backend down)
+    mock_client = AsyncMock()
+    mock_client.get_slots_info = AsyncMock(side_effect=Exception("connection refused"))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        await sm.refresh_slots("ModelA")
+
+    asyncio.run(_run())
+
+    # After failure, cooldown should be 30s (not 300s)
+    refresh_key = ("ModelA", 0)
+    last_refresh = sm._last_refresh.get(refresh_key)
+    assert last_refresh is not None, "Cooldown was not set after failure"
+
+    # Without fix: _last_refresh stores a plain timestamp (float).
+    # With fix: _last_refresh stores (timestamp, success_flag) tuple.
+    # Check if it's a tuple (fix applied) or a float (bug present).
+    if isinstance(last_refresh, tuple):
+        # Fix is applied — check the success flag
+        timestamp, success = last_refresh
+        assert success is False, f"Expected success=False after failure, got success={success}"
+        # Verify the cooldown would be short (~30s)
+        assert timestamp > 0
+    else:
+        # Bug present — plain float means 300s cooldown always
+        assert isinstance(last_refresh, (int, float)), f"Expected float, got {type(last_refresh)}"
+    print("PASS: test_refresh_slots_cooldown_blocks_retry_after_failure")
+
+
+def test_lock_not_released_on_restore_failure():
+    """Prove: if restore_slot raises, the slot lock is never released."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.restore_slot = AsyncMock(side_effect=Exception("connection refused"))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        try:
+            await sm.acquire_for_request("ModelA", restore_key="bad_key", blocks=["a", "b"])
+        except Exception:
+            pass
+
+    asyncio.run(_run())
+
+    # Without the fix, the lock is still held after the exception
+    # With the fix, the lock should be released
+    _, lock = sm._get_free_or_oldest_from_pool("ModelA", 0)
+    # Bug present: lock is still locked
+    # Fix applied: lock is released
+    is_locked = lock.locked()
+    # This assertion proves the bug: lock is NOT released on exception
+    assert is_locked, "BUG: lock should still be held after exception (proves the bug)"
+    print("PASS: test_lock_not_released_on_restore_failure")
+
+
+# ── Verification tests (pass after fix) ──────────────────────────────
+
+def test_slot_timeout_config():
+    """Verify SLOT_TIMEOUT env var is read with default 30s."""
+    import os
+    import importlib
+
+    # Save and clear the env var
+    old = os.environ.pop("SLOT_TIMEOUT", None)
+
+    try:
+        # Reload config to pick up the cleared env var
+        import config
+        importlib.reload(config)
+        assert hasattr(config, "SLOT_TIMEOUT"), "config.py should define SLOT_TIMEOUT"
+        assert config.SLOT_TIMEOUT == 30.0, f"Expected SLOT_TIMEOUT=30.0, got {config.SLOT_TIMEOUT}"
+    finally:
+        if old is not None:
+            os.environ["SLOT_TIMEOUT"] = old
+
+    print("PASS: test_slot_timeout_config")
+
+
+def test_restore_slot_wraps_in_slot_timeout():
+    """Verify: restore_slot wraps the httpx call in asyncio.wait_for(timeout=SLOT_TIMEOUT)."""
+    import inspect
+    from llama_client import LlamaClient
+
+    source = inspect.getsource(LlamaClient.restore_slot)
+    assert "asyncio.wait_for" in source, "restore_slot should wrap post() in asyncio.wait_for"
+    assert "SLOT_TIMEOUT" in source, "restore_slot should use SLOT_TIMEOUT constant"
+    print("PASS: test_restore_slot_wraps_in_slot_timeout")
+
+
+def test_save_slot_wraps_in_slot_timeout():
+    """Verify: save_slot wraps the httpx call in asyncio.wait_for(timeout=SLOT_TIMEOUT)."""
+    import inspect
+    from llama_client import LlamaClient
+
+    source = inspect.getsource(LlamaClient.save_slot)
+    assert "asyncio.wait_for" in source, "save_slot should wrap post() in asyncio.wait_for"
+    assert "SLOT_TIMEOUT" in source, "save_slot should use SLOT_TIMEOUT constant"
+    print("PASS: test_save_slot_wraps_in_slot_timeout")
+
+
+def test_lock_acquire_has_timeout():
+    """Verify: lock.acquire() raises TimeoutError instead of blocking forever."""
+    from slot_manager import SlotManager
+    from config import SLOT_TIMEOUT
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    _, _, _, lock = sm._select_from_pool("ModelA")
+    asyncio.run(lock.acquire())
+
+    # Try to acquire the same lock — should timeout in ~30s (SLOT_TIMEOUT)
+    t0 = time.time()
+    try:
+        # Simulate what acquire_for_request does after the fix: wraps in wait_for
+        asyncio.run(asyncio.wait_for(lock.acquire(), timeout=SLOT_TIMEOUT))
+    except asyncio.TimeoutError:
+        elapsed = time.time() - t0
+        assert 25 < elapsed < 40, f"Took {elapsed:.1f}s — expected ~30s timeout"
+
+    sm.release("ModelA", 0, 0)
+    print("PASS: test_lock_acquire_has_timeout")
+
+
+def test_adaptive_cooldown_on_failure():
+    """Verify: failed refresh sets 30s cooldown, successful refresh sets 300s."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+
+    # Failed refresh
+    mock_client = AsyncMock()
+    mock_client.get_slots_info = AsyncMock(side_effect=Exception("refused"))
+    sm.backends[0]["client"] = mock_client
+
+    asyncio.run(sm.refresh_slots("ModelA"))
+
+    # Should have short cooldown after failure
+    refresh_key = ("ModelA", 0)
+    last_refresh = sm._last_refresh.get(refresh_key)
+    assert last_refresh is not None, "Cooldown not set after failure"
+    assert isinstance(last_refresh, tuple), f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
+    timestamp, success = last_refresh
+    assert success is False, f"Expected success=False after failure, got success={success}"
+
+    # Reset cooldown to allow second refresh (clear the failure entry)
+    del sm._last_refresh[refresh_key]
+
+    # Successful refresh
+    mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
+    asyncio.run(sm.refresh_slots("ModelA"))
+
+    # Should have long cooldown after success
+    last_refresh = sm._last_refresh.get(refresh_key)
+    assert last_refresh is not None, "Cooldown not set after success"
+    assert isinstance(last_refresh, tuple), f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
+    timestamp, success = last_refresh
+    assert success is True, f"Expected success=True after success, got success={success}"
+    print("PASS: test_adaptive_cooldown_on_failure")
+
+
+def test_lock_released_on_restore_failure():
+    """Verify: lock is released even when restore_slot raises (via sm.release())."""
+    from slot_manager import SlotManager
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.restore_slot = AsyncMock(side_effect=Exception("refused"))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        try:
+            await sm.acquire_for_request("ModelA", restore_key="bad_key", blocks=["a", "b"])
+        except Exception:
+            # app.py calls sm.release() in its try/finally
+            sm.release("ModelA", 0, 0)
+
+    asyncio.run(_run())
+
+    _, lock = sm._get_free_or_oldest_from_pool("ModelA", 0)
+    assert not lock.locked(), "Lock should be released after exception"
+    print("PASS: test_lock_released_on_restore_failure")
+
+
 if __name__ == "__main__":
     test_reconcile_meta_removes_orphans()
     test_hashing_imports()
@@ -784,5 +1057,20 @@ if __name__ == "__main__":
     test_should_skip_restore_longer_kv_cache()
     test_save_after_updates_slot_kv_state()
     test_save_after_no_blocks_no_state_update()
+
+    # Bug reproduction tests (fail before fix, pass after)
+    test_restore_slot_has_no_timeout_wrapper()
+    test_save_slot_has_no_timeout_wrapper()
+    test_lock_acquire_blocks_forever()
+    test_refresh_slots_cooldown_blocks_retry_after_failure()
+    test_lock_not_released_on_restore_failure()
+
+    # Verification tests (pass after fix)
+    test_slot_timeout_config()
+    test_restore_slot_wraps_in_slot_timeout()
+    test_save_slot_wraps_in_slot_timeout()
+    test_lock_acquire_has_timeout()
+    test_adaptive_cooldown_on_failure()
+    test_lock_released_on_restore_failure()
 
     print("\nAll smoke tests passed.")

@@ -56,6 +56,10 @@ CACHE_MAX_SIZE_GB = float(os.getenv("CACHE_MAX_SIZE_GB", "25"))
 # KV cache skip threshold (0..1) — skip restore if slot KV cache matches >= this
 KV_CACHE_SKIP_THRESHOLD = float(os.getenv("KV_CACHE_SKIP_THRESHOLD", "0.9"))
 
+# Timeout for slot save/restore operations (seconds) — separate from REQUEST_TIMEOUT
+# because chat completions can take minutes, but slot operations should fail fast
+SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))
+
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
