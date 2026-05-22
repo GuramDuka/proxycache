@@ -288,7 +288,6 @@ async def chat(req: Request):
             if resp.status_code != 200:
                 err_txt = await resp.aread()
                 await resp.aclose()
-                sm.release(model_name, be_id, slot_id)
                 return JSONResponse(
                     {"error": err_txt.decode("utf-8", "ignore")},
                     status_code=resp.status_code,
@@ -323,28 +322,24 @@ async def chat(req: Request):
                 stream=False,
             )
             if not isinstance(out, dict):
-                sm.release(model_name, be_id, slot_id)
                 return JSONResponse(
                     {"error": "provider non-JSON body"},
                     status_code=502,
                 )
 
             ok = False
-            try:
-                if is_big:
-                    ok, _ = await sm.save_after(
-                        model_name, be_id, slot_id, key, backend_model_id, blocks,
+            if is_big:
+                ok, _ = await sm.save_after(
+                    model_name, be_id, slot_id, key, backend_model_id, blocks,
+                )
+                if ok:
+                    hs.write_meta(
+                        key,
+                        prefix,
+                        blocks,
+                        WORDS_PER_BLOCK,
+                        backend_model_id,
                     )
-                    if ok:
-                        hs.write_meta(
-                            key,
-                            prefix,
-                            blocks,
-                            WORDS_PER_BLOCK,
-                            backend_model_id,
-                        )
-            finally:
-                sm.release(model_name, be_id, slot_id)
 
             log.info(
                 "json_done model=%s be=%d slot=%d key=%s saved=%s is_big=%s dur_ms=%d",
@@ -357,7 +352,9 @@ async def chat(req: Request):
             return JSONResponse(content=out, status_code=200)
 
     except Exception as e:
-        sm.release(model_name, be_id, slot_id)
         log.exception("chat_error model=%s be=%d slot=%d key=%s: %s",
                       model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if not stream:
+            sm.release(model_name, be_id, slot_id)
