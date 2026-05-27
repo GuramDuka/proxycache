@@ -30,7 +30,7 @@ WORDS_PER_BLOCK = int(os.getenv("WORDS_PER_BLOCK", "100"))
 BIG_THRESHOLD_WORDS = int(os.getenv("BIG_THRESHOLD_WORDS", "500"))
 
 # LCP threshold (0..1)
-LCP_TH = float(os.getenv("LCP_TH", "0.6"))
+LCP_TH = float(os.getenv("LCP_TH", "0.2"))
 
 # Meta dir
 META_DIR = os.path.join(os.getcwd(), os.getenv("META_DIR", "kv_meta"))

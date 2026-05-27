@@ -35,7 +35,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from config import (BACKENDS, WORDS_PER_BLOCK, BIG_THRESHOLD_WORDS,
                     LCP_TH, META_DIR, MODEL_ID, PORT,
-                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB)
+                    CACHE_DIR, CACHE_MAX_AGE_HOURS, CACHE_MAX_SIZE_GB,
+                    SLOT_TIMEOUT)
 
 import hashing as hs
 from llama_client import LlamaClient
@@ -92,6 +93,7 @@ async def models():
 
 async def start_stream_task(
     resp: httpx.Response,
+    req: Request,
     model_name: str,
     backend_id: int,
     slot_id: int,
@@ -102,14 +104,39 @@ async def start_stream_task(
     restore_key: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
     queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+    cancelled = {'value': False}
 
     async def reader():
         try:
             log.info("stream_reader_start model=%s be=%d slot=%d key=%s",
                      model_name, backend_id, slot_id, key[:16])
-            async for chunk in resp.aiter_raw():
-                if not chunk:
+            iterator = resp.aiter_raw()
+            wait_timeout = 1.0
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=wait_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        if await req.is_disconnected():
+                            log.warning(
+                                "client_disconnected model=%s be=%d slot=%d key=%s",
+                                model_name, backend_id, slot_id, key[:16],
+                            )
+                            cancelled['value'] = True
+                            break
+                    except Exception:
+                        pass
+                    wait_timeout = min(wait_timeout * 2, 10.0)
                     continue
+                except StopAsyncIteration:
+                    break
+
+                if not chunk:
+                    wait_timeout = 1.0
+                    continue
+                wait_timeout = 1.0
                 try:
                     await queue.put(chunk)
                 except asyncio.CancelledError:
@@ -129,21 +156,25 @@ async def start_stream_task(
             except Exception:
                 pass
             ok = False
-            try:
-                ok, _ = await sm.save_after(
-                    model_name, backend_id, slot_id, key, model_name, blocks,
-                )
-            except asyncio.CancelledError:
-                log.warning("save_after_cancelled model=%s be=%d slot=%d",
-                            model_name, backend_id, slot_id)
-            except Exception as e:
-                log.warning("save_after_exception model=%s be=%d slot=%d: %s",
-                            model_name, backend_id, slot_id, e)
-            if ok:
+            if not cancelled['value']:
                 try:
-                    hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
+                    ok, _ = await asyncio.wait_for(
+                        sm.save_after(
+                            model_name, backend_id, slot_id, key, model_name, blocks,
+                        ),
+                        timeout=SLOT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("save_after_timeout model=%s be=%d slot=%d",
+                                model_name, backend_id, slot_id)
                 except Exception as e:
-                    log.warning("write_meta_exception key=%s: %s", key[:16], e)
+                    log.warning("save_after_exception model=%s be=%d slot=%d: %s",
+                                model_name, backend_id, slot_id, e)
+                if ok:
+                    try:
+                        hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
+                    except Exception as e:
+                        log.warning("write_meta_exception key=%s: %s", key[:16], e)
             sm.release(model_name, backend_id, slot_id)
             log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
                      model_name, backend_id, slot_id, key[:16], ok)
@@ -165,6 +196,7 @@ async def start_stream_task(
                 yield item
         except asyncio.CancelledError:
             log.warning("gen_cancelled, cancelling reader task")
+            cancelled['value'] = True
             task.cancel()
             raise
         finally:
@@ -295,6 +327,7 @@ async def chat(req: Request):
 
             gen = await start_stream_task(
                 resp,
+                req,
                 model_name,
                 be_id,
                 slot_id,

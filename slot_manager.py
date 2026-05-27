@@ -387,6 +387,9 @@ class SlotManager:
             # Clean up leaked KV state on failure so the slot doesn't get
             # incorrectly skipped on its next use
             self._slot_kv_state.pop(g, None)
+            # Release lock so the slot isn't held forever after a failure
+            if lock.locked():
+                lock.release()
             raise
 
     async def save_after(
