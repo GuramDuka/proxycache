@@ -61,7 +61,8 @@ async def startup():
     app.state.clients = clients
     app.state.sm = sm
     app.state.executor = ThreadPoolExecutor(max_workers=2)
-    log.info("app_start n_backends=%d port=%d", len(BACKENDS), PORT)
+    log.info("app_start n_backends=%d port=%d backends=%s", len(BACKENDS), PORT,
+             [be["url"] for be in BACKENDS])
 
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
     reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR)
@@ -91,123 +92,136 @@ async def models():
     return resp.json()
 
 
-async def start_stream_task(
-    resp: httpx.Response,
-    req: Request,
-    model_name: str,
-    backend_id: int,
-    slot_id: int,
-    key: str,
-    prefix: str,
-    blocks: List[str],
-    sm: SlotManager,
-    restore_key: Optional[str] = None,
-) -> AsyncGenerator[bytes, None]:
-    queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
-    cancelled = {'value': False}
+class StreamReader:
+    def __init__(self, resp: httpx.Response, req: Request,
+                 model_name: str, backend_id: int, slot_id: int,
+                 key: str, prefix: str, blocks: List[str],
+                 sm: SlotManager):
+        self.resp = resp
+        self.req = req
+        self.model_name = model_name
+        self.backend_id = backend_id
+        self.slot_id = slot_id
+        self.key = key
+        self.prefix = prefix
+        self.blocks = blocks
+        self.sm = sm
+        self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+        self._cancelled = False
+        self._task: asyncio.Task | None = None
 
-    async def reader():
-        try:
-            log.info("stream_reader_start model=%s be=%d slot=%d key=%s",
-                     model_name, backend_id, slot_id, key[:16])
-            iterator = resp.aiter_raw()
-            wait_timeout = 1.0
-            while True:
+    async def _read_loop(self):
+        log.info("stream_reader_start model=%s be=%d slot=%d key=%s",
+                 self.model_name, self.backend_id, self.slot_id, self.key[:16])
+        iterator = self.resp.aiter_raw()
+        wait_timeout = 1.0
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=wait_timeout,
+                )
+            except asyncio.TimeoutError:
                 try:
-                    chunk = await asyncio.wait_for(
-                        iterator.__anext__(), timeout=wait_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    try:
-                        if await req.is_disconnected():
-                            log.warning(
-                                "client_disconnected model=%s be=%d slot=%d key=%s",
-                                model_name, backend_id, slot_id, key[:16],
-                            )
-                            cancelled['value'] = True
-                            break
-                    except Exception:
-                        pass
-                    wait_timeout = min(wait_timeout * 2, 10.0)
-                    continue
-                except StopAsyncIteration:
-                    break
+                    if await self.req.is_disconnected():
+                        log.warning(
+                            "client_disconnected model=%s be=%d slot=%d key=%s",
+                            self.model_name, self.backend_id, self.slot_id, self.key[:16],
+                        )
+                        self._cancelled = True
+                        break
+                except Exception:
+                    pass
+                wait_timeout = min(wait_timeout * 2, 10.0)
+                continue
+            except StopAsyncIteration:
+                break
 
-                if not chunk:
-                    wait_timeout = 1.0
-                    continue
+            if not chunk:
                 wait_timeout = 1.0
-                try:
-                    await queue.put(chunk)
-                except asyncio.CancelledError:
-                    log.warning("stream_reader_cancelled_put model=%s be=%d slot=%d key=%s",
-                                model_name, backend_id, slot_id, key[:16])
-                    raise
+                continue
+            wait_timeout = 1.0
+            try:
+                await asyncio.wait_for(self.queue.put(chunk), timeout=5.0)
+            except asyncio.TimeoutError:
+                log.warning("stream_queue_full model=%s be=%d slot=%d key=%s",
+                            self.model_name, self.backend_id, self.slot_id, self.key[:16])
+                self._cancelled = True
+                break
+            except asyncio.CancelledError:
+                log.warning("stream_reader_cancelled_put model=%s be=%d slot=%d key=%s",
+                            self.model_name, self.backend_id, self.slot_id, self.key[:16])
+                raise
+
+    async def _save(self) -> tuple:
+        ok = False
+        try:
+            ok, _ = await asyncio.wait_for(
+                self.sm.save_after(
+                    self.model_name, self.backend_id, self.slot_id,
+                    self.key, self.model_name, self.blocks,
+                ),
+                timeout=SLOT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("save_after_timeout model=%s be=%d slot=%d",
+                        self.model_name, self.backend_id, self.slot_id)
+        except Exception as e:
+            log.warning("save_after_exception model=%s be=%d slot=%d: %s",
+                        self.model_name, self.backend_id, self.slot_id, e)
+        if ok:
+            try:
+                hs.write_meta(self.key, self.prefix, self.blocks,
+                              WORDS_PER_BLOCK, self.model_name)
+            except Exception as e:
+                log.warning("write_meta_exception key=%s: %s", self.key[:16], e)
+        return ok
+
+    async def _cleanup(self):
+        try:
+            await self.resp.aclose()
+        except Exception:
+            pass
+        if not self._cancelled:
+            ok = await self._save()
+        else:
+            ok = False
+        self.sm.release(self.model_name, self.backend_id, self.slot_id)
+        log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
+                 self.model_name, self.backend_id, self.slot_id, self.key[:16], ok)
+        try:
+            self.queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _reader(self):
+        try:
+            await self._read_loop()
         except asyncio.CancelledError:
             log.warning("stream_reader_cancelled model=%s be=%d slot=%d key=%s",
-                        model_name, backend_id, slot_id, key[:16])
+                        self.model_name, self.backend_id, self.slot_id, self.key[:16])
             raise
         except Exception as e:
             log.exception("stream_reader_error model=%s be=%d slot=%d key=%s: %s",
-                          model_name, backend_id, slot_id, key[:16], e)
+                          self.model_name, self.backend_id, self.slot_id, self.key[:16], e)
         finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            ok = False
-            if not cancelled['value']:
-                try:
-                    ok, _ = await asyncio.wait_for(
-                        sm.save_after(
-                            model_name, backend_id, slot_id, key, model_name, blocks,
-                        ),
-                        timeout=SLOT_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("save_after_timeout model=%s be=%d slot=%d",
-                                model_name, backend_id, slot_id)
-                except Exception as e:
-                    log.warning("save_after_exception model=%s be=%d slot=%d: %s",
-                                model_name, backend_id, slot_id, e)
-                if ok:
-                    try:
-                        hs.write_meta(key, prefix, blocks, WORDS_PER_BLOCK, model_name)
-                    except Exception as e:
-                        log.warning("write_meta_exception key=%s: %s", key[:16], e)
-            sm.release(model_name, backend_id, slot_id)
-            log.info("stream_reader_done model=%s be=%d slot=%d key=%s saved=%s",
-                     model_name, backend_id, slot_id, key[:16], ok)
-            try:
-                await queue.put(None)
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+            await self._cleanup()
 
-    task = asyncio.create_task(reader())
-
-    async def gen() -> AsyncGenerator[bytes, None]:
+    async def stream(self):
+        self._task = asyncio.create_task(self._reader())
         try:
             while True:
-                item = await queue.get()
+                item = await self.queue.get()
                 if item is None:
                     break
                 yield item
         except asyncio.CancelledError:
             log.warning("gen_cancelled, cancelling reader task")
-            cancelled['value'] = True
-            task.cancel()
-            raise
-        finally:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-    return gen()
+            self._cancelled = True
+            self._task.cancel()
 
 
 @app.post("/v1/chat/completions")
@@ -310,6 +324,7 @@ async def chat(req: Request):
         restored,
     )
 
+    _reader_created = False
     try:
         if stream:
             resp = await client.chat_completions(
@@ -325,18 +340,10 @@ async def chat(req: Request):
                     status_code=resp.status_code,
                 )
 
-            gen = await start_stream_task(
-                resp,
-                req,
-                model_name,
-                be_id,
-                slot_id,
-                key,
-                prefix,
-                blocks,
-                sm,
-                restore_key,
-            )
+            reader = StreamReader(resp, req, model_name, be_id, slot_id,
+                                  key, prefix, blocks, sm)
+            gen = reader.stream()
+            _reader_created = True
 
             headers = {
                 "Cache-Control": "no-cache",
@@ -389,5 +396,5 @@ async def chat(req: Request):
                       model_name, be_id, slot_id, key[:16], e)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
-        if not stream:
+        if not _reader_created:
             sm.release(model_name, be_id, slot_id)

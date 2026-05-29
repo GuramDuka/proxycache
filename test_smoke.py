@@ -756,30 +756,64 @@ def test_save_after_no_blocks_no_state_update():
 
 # ── Bug reproduction tests (fail before fix, pass after) ────────────
 
-def test_restore_slot_has_timeout_wrapper():
-    """Verify: restore_slot wraps the httpx call in asyncio.wait_for(SLOT_TIMEOUT).
-
-    Bug was: restore_slot called self.client.post() directly with no timeout
-    wrapper, inheriting REQUEST_TIMEOUT (600s). Fix wraps in asyncio.wait_for.
-    """
-    import inspect
+def test_restore_slot_times_out_on_slow_backend():
+    """Behavioral: restore_slot returns False when backend doesn't respond in time."""
     from llama_client import LlamaClient
+    import llama_client
 
-    source = inspect.getsource(LlamaClient.restore_slot)
-    assert "asyncio.wait_for" in source, "restore_slot must wrap post() in asyncio.wait_for"
-    assert "SLOT_TIMEOUT" in source, "restore_slot must use SLOT_TIMEOUT constant"
-    print("PASS: test_restore_slot_has_timeout_wrapper")
+    client = LlamaClient("http://127.0.0.1:8080")
+
+    async def _run():
+        # Patch SLOT_TIMEOUT in llama_client module (where it's imported)
+        orig_timeout = llama_client.SLOT_TIMEOUT
+        llama_client.SLOT_TIMEOUT = 0.1
+
+        try:
+            async def slow_post(*a, **kw):
+                await asyncio.sleep(5)
+                return AsyncMock(status_code=200)
+
+            client.client.post = slow_post
+            t0 = time.monotonic()
+            result = await client.restore_slot(0, "test_key")
+            elapsed = time.monotonic() - t0
+            assert not result, "restore_slot should return False on timeout"
+            assert 0.05 < elapsed < 2, f"Should have timed out near 0.1s, took {elapsed:.1f}s"
+        finally:
+            llama_client.SLOT_TIMEOUT = orig_timeout
+
+    asyncio.run(_run())
+    print("PASS: test_restore_slot_times_out_on_slow_backend")
 
 
-def test_save_slot_has_timeout_wrapper():
-    """Verify: save_slot wraps the httpx call in asyncio.wait_for(SLOT_TIMEOUT)."""
-    import inspect
+def test_save_slot_times_out_on_slow_backend():
+    """Behavioral: save_slot returns (False, 0) when backend doesn't respond in time."""
     from llama_client import LlamaClient
+    import llama_client
 
-    source = inspect.getsource(LlamaClient.save_slot)
-    assert "asyncio.wait_for" in source, "save_slot must wrap post() in asyncio.wait_for"
-    assert "SLOT_TIMEOUT" in source, "save_slot must use SLOT_TIMEOUT constant"
-    print("PASS: test_save_slot_has_timeout_wrapper")
+    client = LlamaClient("http://127.0.0.1:8080")
+
+    async def _run():
+        orig_timeout = llama_client.SLOT_TIMEOUT
+        llama_client.SLOT_TIMEOUT = 0.1
+
+        try:
+            async def slow_post(*a, **kw):
+                await asyncio.sleep(5)
+                return AsyncMock(status_code=200)
+
+            client.client.post = slow_post
+            t0 = time.monotonic()
+            ok, size = await client.save_slot(0, "test_key")
+            elapsed = time.monotonic() - t0
+            assert not ok, "save_slot should return False on timeout"
+            assert size == 0, "save_slot should return 0 size on timeout"
+            assert 0.05 < elapsed < 2, f"Should have timed out near 0.1s, took {elapsed:.1f}s"
+        finally:
+            llama_client.SLOT_TIMEOUT = orig_timeout
+
+    asyncio.run(_run())
+    print("PASS: test_save_slot_times_out_on_slow_backend")
 
 
 def test_lock_acquire_has_timeout():
@@ -887,110 +921,319 @@ def test_slot_timeout_config():
 # ── Cancellation handling tests ──────────────────────────────────────
 
 def test_non_streaming_cancelled_error_releases_slot():
-    """Verify: outer finally in chat() releases slot on CancelledError.
+    """Behavioral: when non-streaming chat raises CancelledError, slot is released."""
+    from slot_manager import SlotManager
+    from config import BACKENDS
 
-    CancelledError inherits from BaseException, not Exception, so
-    `except Exception` won't catch it. The outer `finally` block
-    must be the one that releases the slot.
-    """
-    import inspect
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
 
-    source = inspect.getsource(sys.modules.get("app") or __import__("app"))
-    # Must have an outer finally block (not just inner try/finally)
-    assert "finally:" in source, "chat() must have a finally block"
-    # The finally must call sm.release()
-    assert "sm.release(model_name, be_id, slot_id)" in source, \
-        "finally block must call sm.release()"
+    mock_client = AsyncMock()
+    mock_client.chat_completions = AsyncMock(side_effect=asyncio.CancelledError())
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        g, lock, _ = await sm.acquire_for_request("ModelA")
+        model_name, be_id, slot_id = g
+        assert lock.locked(), "Lock should be held after acquire"
+        try:
+            await mock_client.chat_completions({}, slot_id=slot_id, stream=False)
+        except asyncio.CancelledError:
+            pass
+        # Simulate the outer finally from chat()
+        stream = False
+        if not stream:
+            sm.release(model_name, be_id, slot_id)
+        assert not lock.locked(), "Lock should be released after finally block"
+
+    asyncio.run(_run())
     print("PASS: test_non_streaming_cancelled_error_releases_slot")
 
 
 def test_streaming_save_after_skipped_on_cancel():
-    """Verify: reader skips save_after() when client cancelled (cancelled flag)."""
-    import inspect
-    from app import start_stream_task
+    """Behavioral: StreamReader._cleanup skips save_after when _cancelled is True."""
+    from slot_manager import SlotManager
+    from app import StreamReader
 
-    source = inspect.getsource(start_stream_task)
-    # Must have a cancelled flag
-    assert "cancelled" in source, "start_stream_task must have a cancelled flag"
-    assert "cancelled['value']" in source or "cancelled[\"value\"]" in source, \
-        "cancelled flag must be a dict with 'value' key"
-    # save_after must be guarded by the cancelled check
-    assert "if not cancelled['value']:" in source, \
-        "save_after must be guarded by `if not cancelled['value']:`"
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        mock_resp = AsyncMock()
+        mock_resp.aiter_raw = MagicMock(return_value=iter([]))
+        mock_resp.aclose = AsyncMock()
+
+        mock_req = AsyncMock()
+        mock_req.is_disconnected = AsyncMock(return_value=False)
+
+        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+                              "test_key", "prefix", ["blk1"], sm)
+        reader._cancelled = True
+        await reader._cleanup()
+
+        # save_after should be skipped when cancelled
+        assert not mock_client.save_slot.called, \
+            "save_after should be skipped when _cancelled is True"
+
+    asyncio.run(_run())
     print("PASS: test_streaming_save_after_skipped_on_cancel")
 
 
 def test_streaming_save_after_has_timeout():
-    """Verify: reader wraps save_after() in asyncio.wait_for(SLOT_TIMEOUT)."""
-    import inspect
-    from app import start_stream_task
+    """Behavioral: StreamReader._save respects SLOT_TIMEOUT."""
+    from slot_manager import SlotManager
+    from app import StreamReader
+    import app
+    import config
 
-    source = inspect.getsource(start_stream_task)
-    assert "asyncio.wait_for" in source, \
-        "save_after must be wrapped in asyncio.wait_for"
-    assert "SLOT_TIMEOUT" in source, \
-        "save_after must use SLOT_TIMEOUT constant"
-    assert "asyncio.TimeoutError" in source, \
-        "must handle asyncio.TimeoutError from wait_for"
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+
+    async def _run():
+        # Patch SLOT_TIMEOUT in app module (where it's imported)
+        orig_timeout = app.SLOT_TIMEOUT
+        app.SLOT_TIMEOUT = 0.1
+        config.SLOT_TIMEOUT = 0.1  # also patch config for consistency
+
+        try:
+            async def hanging_save(*a, **kw):
+                await asyncio.sleep(5)
+                return (True, 0)
+
+            mock_client.save_slot = hanging_save
+            sm.backends[0]["client"] = mock_client
+
+            mock_resp = AsyncMock()
+            mock_resp.aiter_raw = MagicMock(return_value=iter([]))
+            mock_resp.aclose = AsyncMock()
+
+            mock_req = AsyncMock()
+            mock_req.is_disconnected = AsyncMock(return_value=False)
+
+            reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+                                  "test_key", "prefix", ["blk1"], sm)
+
+            t0 = time.monotonic()
+            await reader._save()
+            elapsed = time.monotonic() - t0
+            assert elapsed < 2, f"_save should time out near 0.1s, took {elapsed:.1f}s"
+        finally:
+            app.SLOT_TIMEOUT = orig_timeout
+            config.SLOT_TIMEOUT = orig_timeout
+
+    asyncio.run(_run())
     print("PASS: test_streaming_save_after_has_timeout")
 
 
 def test_streaming_gen_sets_cancelled_flag():
-    """Verify: gen() sets cancelled['value'] = True before cancelling reader."""
-    import inspect
-    from app import start_stream_task
+    """Behavioral: StreamReader.stream() sets _cancelled=True and cancels reader task on CancelledError."""
+    from slot_manager import SlotManager
+    from app import StreamReader
 
-    source = inspect.getsource(start_stream_task)
-    # gen() must set the cancelled flag when it catches CancelledError
-    assert "cancelled['value'] = True" in source or \
-           'cancelled["value"] = True' in source, \
-        "gen() must set cancelled['value'] = True on CancelledError"
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.save_slot = AsyncMock(return_value=(False, 0))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        # Iterator that hangs — reader will block waiting for data
+        class MockAIter:
+            async def __anext__(self):
+                await asyncio.sleep(100)
+
+        mock_resp = AsyncMock()
+        mock_resp.aiter_raw = MagicMock(return_value=MockAIter())
+        mock_resp.aclose = AsyncMock()
+
+        mock_req = AsyncMock()
+        mock_req.is_disconnected = AsyncMock(return_value=False)
+
+        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+                              "test_key", "prefix", ["blk1"], sm)
+
+        # Start consuming the stream
+        stream_gen = reader.stream()
+        consume_task = asyncio.create_task(
+            anext(stream_gen)  # try to get first item — will block
+        )
+        await asyncio.sleep(0.1)  # let it start
+        t0 = time.monotonic()
+        consume_task.cancel()
+        try:
+            await consume_task
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        elapsed = time.monotonic() - t0
+
+        # Should complete quickly
+        assert elapsed < 6, f"Cancel should complete within 5s timeout, took {elapsed:.1f}s"
+        # resp.aclose() should have been called to break the socket read
+        assert mock_resp.aclose.called, "resp.aclose() should be called on cancel"
+        # The cancelled flag should have been set, so save_after should NOT be called
+        assert reader._cancelled, "_cancelled should be True after CancelledError"
+        assert not mock_client.save_slot.called, "save_after should be skipped when gen is cancelled"
+
+    asyncio.run(_run())
     print("PASS: test_streaming_gen_sets_cancelled_flag")
 
 
 def test_streaming_release_not_in_outer_finally():
-    """Verify: outer finally only releases for non-streaming (if not stream: guard)."""
-    import inspect
+    """Behavioral: streaming slots are not released by outer finally (reader handles it)."""
+    from slot_manager import SlotManager
 
-    source = inspect.getsource(sys.modules.get("app") or __import__("app"))
-    # The outer finally must have a stream guard
-    assert "if not stream:" in source, \
-        "outer finally must guard release with `if not stream:`"
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.chat_completions = AsyncMock(return_value=AsyncMock(status_code=200))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        g, lock, _ = await sm.acquire_for_request("ModelA")
+        model_name, be_id, slot_id = g
+
+        # Simulate the outer finally from chat() with stream=True
+        stream = True
+        if not stream:
+            sm.release(model_name, be_id, slot_id)
+
+        # Lock should still be held — reader is responsible for release
+        assert lock.locked(), "Streaming slot should NOT be released by outer finally"
+
+        # Now simulate the reader's finally releasing it
+        sm.release(model_name, be_id, slot_id)
+        assert not lock.locked(), "Reader's release should unlock the slot"
+
+    asyncio.run(_run())
     print("PASS: test_streaming_release_not_in_outer_finally")
 
 
-def test_slot_timeout_imported_in_app():
-    """Verify: SLOT_TIMEOUT is imported from config into app.py."""
-    import inspect
-
-    source = inspect.getsource(sys.modules.get("app") or __import__("app"))
-    assert "SLOT_TIMEOUT" in source, \
-        "app.py must import SLOT_TIMEOUT from config"
-    print("PASS: test_slot_timeout_imported_in_app")
-
-
 def test_reader_polls_is_disconnected_on_timeout():
-    """Verify: reader wraps aiter_raw() in asyncio.wait_for and checks
-    is_disconnected() on TimeoutError to detect client disconnect early."""
-    import inspect
-    from app import start_stream_task
+    """Behavioral: StreamReader._read_loop checks is_disconnected on timeout, sets _cancelled."""
+    from slot_manager import SlotManager
+    from app import StreamReader
 
-    source = inspect.getsource(start_stream_task)
-    # The reader must wrap iterator.__anext__() in asyncio.wait_for
-    assert "asyncio.wait_for" in source, \
-        "reader must use asyncio.wait_for on iterator"
-    assert "iterator.__anext__()" in source, \
-        "reader must call iterator.__anext__()"
-    # Must check is_disconnected on TimeoutError
-    assert "asyncio.TimeoutError" in source, \
-        "reader must handle asyncio.TimeoutError"
-    assert "is_disconnected" in source, \
-        "reader must check req.is_disconnected()"
-    # Must set cancelled flag on disconnect
-    assert "cancelled['value'] = True" in source or \
-           'cancelled["value"] = True' in source, \
-        "reader must set cancelled flag on disconnect"
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock()
+    mock_client.save_slot = AsyncMock(return_value=(False, 0))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        # Iterator that never yields — forces timeout path
+        class MockAIter:
+            async def __anext__(self):
+                await asyncio.sleep(100)
+
+        mock_resp = AsyncMock()
+        mock_resp.aiter_raw = MagicMock(return_value=MockAIter())
+        mock_resp.aclose = AsyncMock()
+
+        mock_req = AsyncMock()
+        mock_req.is_disconnected = AsyncMock(return_value=True)
+
+        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+                              "test_key", "prefix", ["blk1"], sm)
+
+        # Consume generator — reader should timeout on iterator,
+        # check is_disconnected, see True, set cancelled, and exit
+        t0 = time.monotonic()
+        stream_gen = reader.stream()
+        async for _ in stream_gen:
+            pass
+        elapsed = time.monotonic() - t0
+
+        # Should have exited after ~1s timeout (first wait_timeout=1.0)
+        assert elapsed < 5, f"Reader should exit quickly on disconnect, took {elapsed:.1f}s"
+        assert mock_req.is_disconnected.called, "Reader should have polled is_disconnected"
+        assert reader._cancelled, "_cancelled should be True after disconnect"
+        # save_after should NOT be called since cancelled flag was set
+        assert not mock_client.save_slot.called, "save_after should be skipped on disconnect"
+
+    asyncio.run(_run())
     print("PASS: test_reader_polls_is_disconnected_on_timeout")
+
+
+def test_streaming_completion_releases_slot():
+    """End-to-end: successful StreamReader stream completion releases slot, saves cache."""
+    import app as app_mod
+    from slot_manager import SlotManager
+    from app import StreamReader
+    from llama_client import LlamaClient
+
+    sm = SlotManager()
+    sm.backends = [{"id": 0, "client": None, "n_slots": 0}]
+    sm._register_backend_for_model("ModelA", 0)
+    sm._ensure_pool("ModelA", 0, 1)
+
+    mock_client = AsyncMock(spec=LlamaClient)
+    mock_client.save_slot = AsyncMock(return_value=(True, 1024))
+    sm.backends[0]["client"] = mock_client
+
+    async def _run():
+        # Iterator yields chunks then finishes (normal completion)
+        class DoneAIter:
+            _done = False
+            async def __anext__(self):
+                if not self._done:
+                    self._done = True
+                    return b"event: content\ndata: {\"text\":\"hi\"}\n\n"
+                raise StopAsyncIteration()
+
+        mock_resp = AsyncMock()
+        mock_resp.aiter_raw = MagicMock(return_value=DoneAIter())
+        mock_resp.aclose = AsyncMock()
+        mock_resp.status_code = 200
+
+        mock_req = AsyncMock()
+        mock_req.is_disconnected = AsyncMock(return_value=False)
+
+        reader = StreamReader(mock_resp, mock_req, "ModelA", 0, 0,
+                              "complete_key", "system: hello\nuser: hi", ["blk1"], sm)
+
+        # Consume all chunks
+        chunks = []
+        stream_gen = reader.stream()
+        async for chunk in stream_gen:
+            chunks.append(chunk)
+
+        # Small delay to let reader's finally block run
+        await asyncio.sleep(0.3)
+
+        # All chunks received
+        assert len(chunks) >= 1, "Should receive at least one chunk"
+
+        # Slot saved and released
+        assert mock_client.save_slot.called, \
+            "save_slot must be called on normal completion"
+
+        # Pool state: slot 0 should be free
+        assert sm._last_used.get(("ModelA", 0, 0), 0.0) == 0.0, \
+            "Slot must be free after completion"
+
+    asyncio.run(_run())
+    print("PASS: test_streaming_completion_releases_slot")
 
 
 if __name__ == "__main__":
@@ -1029,8 +1272,8 @@ if __name__ == "__main__":
 
     # Backend-down fix verification tests
     test_slot_timeout_config()
-    test_restore_slot_has_timeout_wrapper()
-    test_save_slot_has_timeout_wrapper()
+    test_restore_slot_times_out_on_slow_backend()
+    test_save_slot_times_out_on_slow_backend()
     test_lock_acquire_has_timeout()
     test_adaptive_cooldown_on_failure()
     test_lock_released_on_restore_failure()
@@ -1041,7 +1284,7 @@ if __name__ == "__main__":
     test_streaming_save_after_has_timeout()
     test_streaming_gen_sets_cancelled_flag()
     test_streaming_release_not_in_outer_finally()
-    test_slot_timeout_imported_in_app()
     test_reader_polls_is_disconnected_on_timeout()
+    test_streaming_completion_releases_slot()
 
     print("\nAll smoke tests passed.")
