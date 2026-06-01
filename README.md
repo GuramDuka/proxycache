@@ -29,7 +29,7 @@ Client → proxycache (:8081) → llama.cpp (:8000)
 4. **Dispatch**: the proxy forwards the request to llama.cpp with `cache_prompt=true`, `n_keep=-1`, and the slot pinned via three fields (`slot_id`, `id_slot`, `_slot_id` in root, `options`, and query params).
 
 5. **Response**:
-   - **Streaming**: a background `reader` task reads raw SSE bytes → `asyncio.Queue` → `StreamingResponse`. The reader's `finally` always calls `save_after` + `write_meta` + `release`.
+   - **Streaming**: a background `reader` task races socket reads against a disconnect event, pushing SSE bytes into an `asyncio.Queue`. A heartbeat task checks `is_disconnected()` every 0.5s. When the stream completes, `stream()`'s `finally` calls `_cleanup()` which saves the slot (if the stream finished normally), releases it, and puts a sentinel in the queue.
    - **Non-streaming**: the proxy waits for the full response, saves the slot to disk, writes the meta file, then releases the slot.
 
 6. **Save** happens *after* the response completes, never before. Small requests skip save entirely.
