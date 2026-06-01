@@ -3,21 +3,22 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple KV Proxy (бронебойный):
+KV Proxy for llama.cpp with disk save/restore:
 
-- Большие: LCP→restore, затем чат строго в этот же слот, потом save+meta.
-- Малые: свободный/старый слот, без restore и без дискового save/meta.
-- Пин slota дублируется в root/options/query (через клиента).
+- Big requests: LCP matching → restore from disk, then chat strictly in that slot, then save+meta.
+- Small requests: free/oldest slot, no restore, no disk save/meta.
+- Slot pinning is duplicated in root/options/query (via client).
 
-Дополнительно:
+Additionally:
 
-- acquire_for_request обёрнут в таймаут, чтобы не висеть бесконечно, если слот не отпускается.
-- Для stream:
-    * чтение из llama.cpp идёт в отдельной фоновой задаче (reader);
-    * reader пушит чанки в asyncio.Queue;
-    * в своём finally reader всегда делает save_after + write_meta + release,
-      и кладёт в очередь sentinel None;
-    * StreamingResponse читает из очереди и никак не влияет на release слота.
+- acquire_for_request is wrapped in a timeout to avoid hanging forever if a slot is never released.
+- Streaming:
+    * socket reads from llama.cpp run in a background task (reader),
+      racing against a disconnect event;
+    * reader pushes chunks into asyncio.Queue;
+    * stream()'s finally calls _cleanup() — save (if _stream_complete),
+      release, and puts a sentinel in the queue;
+    * heartbeat task checks is_disconnected() every 0.5s.
 - Slot pools are per-model with lazy discovery + refresh cooldown.
 - Cache eviction via ring buffer in SlotManager (age-first, then LRU).
 """

@@ -3,12 +3,12 @@
 # -*- coding: utf-8 -*-
 
 """
-HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots save/restore.
+HTTP client for llama.cpp: /v1/chat/completions (stream/non-stream), /slots save/restore.
 
-- stream: build_request+send(stream=True), сырые байты.
-- non-stream: строгий JSON парсинг + fallback, если content-type не JSON.
-- /slots: filename в JSON-теле (во избежание 500 parse error).
-- Пин слота дублируется в root/options/query.
+- stream: build_request+send(stream=True), raw bytes.
+- non-stream: strict JSON parsing + fallback if content-type is not JSON.
+- /slots: filename in JSON body (avoids 500 parse error on some builds).
+- Slot pinning is duplicated in root/options/query.
 """
 
 import asyncio
@@ -118,7 +118,7 @@ class LlamaClient:
             }
 
     async def save_slot(self, slot_id: int, basename: str, model_id: str = None) -> Tuple[bool, int]:
-        # JSON body: {"filename": "..."} — иначе 500 на некоторых сборках
+        # JSON body: {"filename": "..."} — avoids 500 on some builds
         if BACKEND_MODE == "llama-swap" and model_id:
             path = f"/upstream/{quote(model_id, safe='')}/slots/{slot_id}"
         else:

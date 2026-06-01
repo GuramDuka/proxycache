@@ -3,12 +3,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Raw-хэширование: raw_prefix без ролей, только контент, разделённый двойным переводом строки.
+Raw hashing: raw_prefix strips message roles, concatenates content only, separated by double newlines.
 
-Блоки по 100 слов, LCP по полным SHA256-хэшам.
-Key = sha256(model_id + "\\n" + raw_prefix), т.е. модель включена в ключ.
+Blocks of 100 words, LCP computed over full SHA256 hashes.
+Key = sha256(model_id + "\\n" + raw_prefix), i.e. model is included in the key.
 
-Метафайлы содержат:
+Meta files contain:
 - key
 - model_id
 - prefix_len
@@ -73,7 +73,7 @@ def lcp_blocks(blocks1: List[str], blocks2: List[str]) -> int:
 
 def prefix_key_sha256(text: str) -> str:
     """
-    Базовая SHA256-обёртка; для кеша в неё передаём model_id + "\\n" + raw_prefix.
+    Basic SHA256 wrapper; for cache we pass model_id + "\\n" + raw_prefix.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -103,9 +103,9 @@ def find_best_restore_candidate(
     model_id: str,
 ) -> Optional[Tuple[str, float]]:
     """
-    Ищет лучший кандидат для restore среди мета-файлов ТОЛЬКО текущей модели.
+    Find the best restore candidate among meta files for the CURRENT model only.
 
-    Фильтруем по:
+    Filters by:
     - meta["model_id"] == model_id
     - meta["wpb"] == wpb
     """
@@ -144,7 +144,7 @@ def write_meta(
     model_id: str,
 ) -> None:
     """
-    Записывает/перезаписывает meta-файл для key, привязанный к конкретной модели.
+    Write/overwrite meta file for key, bound to a specific model.
     """
     meta = {
         "key": key,
@@ -166,14 +166,11 @@ def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
     Returns the count of files deleted.
     """
     deleted = 0
-    meta_files = sorted(      glob.glob(os.path.join(meta_dir, "*" + META_SUFFIX)))
+    meta_files = sorted(glob.glob(os.path.join(meta_dir, "*" + META_SUFFIX)))
 
     for meta_path in meta_files:
-        basename = os.path.basename(meta_path);
-        #log.info("Checking meta file: %s", basename)
-        
+        basename = os.path.basename(meta_path)
         cachename = basename.removesuffix(META_SUFFIX)
-        #log.info("Cache filename: %s", cachename)
 
         # Check for corrupted meta files
         try:
