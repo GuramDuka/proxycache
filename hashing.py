@@ -33,6 +33,49 @@ META_SUFFIX = ".meta.json"
 log = logging.getLogger(__name__)
 
 
+def sanitize_backend_dir(backend_key: str) -> str:
+    """Sanitize backend key for use as a filesystem directory name."""
+    return backend_key.replace(":", "-")
+
+
+def meta_file_path(key: str, backend_key: Optional[str] = None) -> str:
+    """Full path to a meta file."""
+    if backend_key:
+        return os.path.join(META_DIR, sanitize_backend_dir(backend_key), f"{key}{META_SUFFIX}")
+    return os.path.join(META_DIR, f"{key}{META_SUFFIX}")
+
+
+def meta_dir(backend_key: str) -> str:
+    """Path to a backend's meta directory."""
+    return os.path.join(META_DIR, sanitize_backend_dir(backend_key))
+
+
+def get_meta_blocks(key: str, backend_key: Optional[str] = None) -> Optional[List[str]]:
+    """Read a meta file and return its blocks list, or None on failure."""
+    path = meta_file_path(key, backend_key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta.get("blocks")
+    except Exception:
+        return None
+
+
+def delete_meta_file(key: str) -> bool:
+    """Delete a meta file by scanning all backend directories. Returns True if deleted."""
+    if not os.path.isdir(META_DIR):
+        return False
+    for entry in os.listdir(META_DIR):
+        candidate = os.path.join(META_DIR, entry, f"{key}{META_SUFFIX}")
+        if os.path.exists(candidate):
+            try:
+                os.remove(candidate)
+                return True
+            except OSError:
+                return False
+    return False
+
+
 def raw_prefix(messages: List[Dict]) -> str:
     parts = []
     for msg in messages or []:
@@ -78,12 +121,23 @@ def prefix_key_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def scan_all_meta() -> List[Dict]:
-    files = sorted(
-        glob.glob(os.path.join(META_DIR, "*" + META_SUFFIX)),
-        key=os.path.getmtime,
-        reverse=True,
-    )
+def scan_all_meta(backend_key: Optional[str] = None) -> List[Dict]:
+    if backend_key:
+        search_dir = meta_dir(backend_key)
+        if not os.path.isdir(search_dir):
+            log.debug("scan_meta backend_dir_missing backend=%s", backend_key)
+            return []
+        files = sorted(
+            glob.glob(os.path.join(search_dir, "*" + META_SUFFIX)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+    else:
+        files = sorted(
+            glob.glob(os.path.join(META_DIR, "*" + META_SUFFIX)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
     metas: List[Dict] = []
     for f in files:
         try:
@@ -101,20 +155,24 @@ def find_best_restore_candidate(
     wpb: int,
     th: float,
     model_id: str,
+    backend_key: str,
 ) -> Optional[Tuple[str, float]]:
     """
-    Find the best restore candidate among meta files for the CURRENT model only.
+    Find the best restore candidate among meta files for the CURRENT model+backend only.
 
     Filters by:
     - meta["model_id"] == model_id
+    - meta["backend"] == backend_key
     - meta["wpb"] == wpb
     """
-    metas = scan_all_meta()
+    metas = scan_all_meta(backend_key)
     best_key: Optional[str] = None
     best_ratio = 0.0
 
     for meta in metas:
         if meta.get("model_id") != model_id:
+            continue
+        if meta.get("backend") != backend_key:
             continue
         if int(meta.get("wpb") or 0) != wpb:
             continue
@@ -142,70 +200,144 @@ def write_meta(
     blocks: List[str],
     wpb: int,
     model_id: str,
+    backend_key: str,
 ) -> None:
     """
-    Write/overwrite meta file for key, bound to a specific model.
+    Write/overwrite meta file for key, bound to a specific model and backend.
     """
     meta = {
         "key": key,
         "model_id": model_id,
+        "backend": backend_key,
         "prefix_len": len(prefix_text),
         "wpb": wpb,
         "blocks": blocks,
         "last_written": time.time(),
     }
-    path = os.path.join(META_DIR, f"{key}{META_SUFFIX}")
+    d = meta_dir(backend_key)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{key}{META_SUFFIX}")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
-    log.info("Saved cache for key %s (model: %s, %d blocks)", key[:16], model_id, len(blocks))
+    log.info("Saved cache for key %s (model: %s, backend: %s, %d blocks)", key[:16], model_id, backend_key, len(blocks))
 
 
-def reconcile_meta(meta_dir: str, cache_dir: str) -> int:
+def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[List[str]] = None, backend_agents: Optional[Dict[str, str]] = None) -> int:
     """
-    Scans all meta files and removes corrupted ones or orphans (meta files with no matching cache).
+    Scans meta files organized by backend and removes corrupted ones or orphans.
+    Uses cache agent API for remote file size lookups when available.
     Returns the count of files deleted.
     """
     deleted = 0
-    meta_files = sorted(glob.glob(os.path.join(meta_dir, "*" + META_SUFFIX)))
+    deleted_backends = set()
 
-    for meta_path in meta_files:
-        basename = os.path.basename(meta_path)
-        cachename = basename.removesuffix(META_SUFFIX)
+    if backend_keys:
+        for backend_key in backend_keys:
+            backend_dir = meta_dir(backend_key)
+            if not os.path.isdir(backend_dir):
+                continue
 
-        # Check for corrupted meta files
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                json.load(f)
-        except (json.JSONDecodeError, Exception) as e:
-            log.warning("Removed corrupted meta file: %s", basename)
+            agent_url = None
+            if backend_agents and backend_key in backend_agents:
+                agent_url = backend_agents[backend_key]
+
+            meta_files = sorted(glob.glob(os.path.join(backend_dir, "*" + META_SUFFIX)))
+
+            for meta_path in meta_files:
+                basename = os.path.basename(meta_path)
+                cachename = basename.removesuffix(META_SUFFIX)
+
+                # Check for corrupted meta files
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        json.load(f)
+                except (json.JSONDecodeError, Exception) as e:
+                    log.warning("Removed corrupted meta file: %s", basename)
+                    try:
+                        os.remove(meta_path)
+                        deleted += 1
+                        deleted_backends.add(backend_key)
+                    except OSError:
+                        pass
+                    continue
+
+                # Check for orphaned meta files (no matching cache on disk)
+                cache_exists = False
+                if agent_url:
+                    try:
+                        from cache_agent_client import get_file_size
+                        result = get_file_size(agent_url, cachename)
+                        if result and result.get("exists", False):
+                            cache_exists = True
+                    except Exception as e:
+                        log.warning("cache_agent_size_fail backend=%s key=%s: %s", backend_key, cachename, e)
+                elif cache_dir and os.path.isdir(cache_dir):
+                    cache_path = os.path.join(cache_dir, cachename)
+                    if os.path.exists(cache_path):
+                        cache_exists = True
+
+                if not cache_exists:
+                    log.info("Removed orphan meta file (no matching cache): %s", basename)
+                    try:
+                        os.remove(meta_path)
+                        deleted += 1
+                        deleted_backends.add(backend_key)
+                    except OSError:
+                        pass
+
+            # Remove empty backend directories
+            if backend_key in deleted_backends:
+                try:
+                    if not os.listdir(backend_dir):
+                        os.rmdir(backend_dir)
+                        log.info("Removed empty backend directory: %s", backend_key)
+                except OSError:
+                    pass
+    else:
+        # Legacy: scan flat meta_base
+        meta_files = sorted(glob.glob(os.path.join(meta_base, "*" + META_SUFFIX)))
+
+        for meta_path in meta_files:
+            basename = os.path.basename(meta_path)
+            cachename = basename.removesuffix(META_SUFFIX)
+
+            # Check for corrupted meta files
             try:
-                os.remove(meta_path)
-                deleted += 1
-            except OSError:
-                pass
-            continue
-
-        # Check for orphaned meta files (no matching cache on disk)
-        if cache_dir and os.path.isdir(cache_dir):
-            cache_path = os.path.join(cache_dir, cachename)
-            #log.info("Looking for cache file: %s", cache_path)
-            if not os.path.exists(cache_path):
-                log.info("Removed orphan meta file (no matching cache): %s", basename)
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, Exception) as e:
+                log.warning("Removed corrupted meta file: %s", basename)
                 try:
                     os.remove(meta_path)
                     deleted += 1
                 except OSError:
                     pass
+                continue
+
+            # Check for orphaned meta files (no matching cache on disk)
+            if cache_dir and os.path.isdir(cache_dir):
+                cache_path = os.path.join(cache_dir, cachename)
+                if not os.path.exists(cache_path):
+                    log.info("Removed orphan meta file (no matching cache): %s", basename)
+                    try:
+                        os.remove(meta_path)
+                        deleted += 1
+                    except OSError:
+                        pass
+
     log.info("Finished reconciling meta state with llama cache dir state")
     return deleted
 
 
-def _get_last_used_time(basename: str, meta_dir: str, cache_dir: str) -> float:
+def _get_last_used_time(basename: str, meta_base: str, cache_dir: str, backend_key: Optional[str] = None) -> float:
     """
     Determines the last-used timestamp for a cache file.
     Priority: last_read -> last_written -> timestamp -> mtime (filesystem fallback).
     """
-    meta_path = os.path.join(meta_dir, f"{basename}{META_SUFFIX}")
+    if backend_key:
+        meta_path = meta_file_path(basename, backend_key)
+    else:
+        meta_path = os.path.join(meta_base, f"{basename}{META_SUFFIX}")
     
     # Try to load from meta file
     if os.path.exists(meta_path):

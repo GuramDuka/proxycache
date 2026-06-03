@@ -65,7 +65,10 @@ async def startup():
              [be["url"] for be in BACKENDS])
 
     # Reconcile meta files on startup (remove corrupted/orphaned entries)
-    reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR)
+    backend_keys = list(backend_manager._backends.keys())
+    backend_agents = {k: v.agent_client.base_url if v.agent_client else None for k, v in backend_manager._backends.items()}
+    backend_agents = {k: v for k, v in backend_agents.items() if v is not None}
+    reconciled = hs.reconcile_meta(META_DIR, CACHE_DIR, backend_keys, backend_agents)
     if reconciled > 0:
         log.info("Cleaned up %d orphaned/corrupted meta files at startup", reconciled)
 
@@ -236,7 +239,7 @@ class StreamReader:
         if ok:
             try:
                 hs.write_meta(self.key, self.prefix, self.blocks,
-                              WORDS_PER_BLOCK, self.model_name)
+                              WORDS_PER_BLOCK, self.model_name, self.backend_id)
             except Exception as e:
                 log.warning("write_meta_exception key=%s: %s", self.key_short, e)
         return ok
@@ -342,12 +345,19 @@ async def chat(req: Request):
 
     restore_key: Optional[str] = None
     if is_big:
-        cand = hs.find_best_restore_candidate(
-            blocks,
-            WORDS_PER_BLOCK,
-            LCP_TH,
-            backend_model_id,
-        )
+        # Get the first backend for this model (will be refined during slot acquisition)
+        candidate_backends = backend_manager.get_backends_for_model(backend_model_id)
+        if candidate_backends:
+            first_backend = candidate_backends[0]
+            cand = hs.find_best_restore_candidate(
+                blocks,
+                WORDS_PER_BLOCK,
+                LCP_TH,
+                backend_model_id,
+                first_backend,
+            )
+        else:
+            cand = None
         if cand:
             restore_key, ratio = cand
             log.info(
@@ -474,6 +484,7 @@ async def chat(req: Request):
                         blocks,
                         WORDS_PER_BLOCK,
                         backend_model_id,
+                        be_id,
                     )
 
             log.info(

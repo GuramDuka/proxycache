@@ -12,6 +12,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+# ── Compile check ─────────────────────────────────────────────────────
+
+def test_compile_all():
+    """Verify all project Python files compile without errors."""
+    import py_compile
+    import glob as _glob
+    root = os.path.dirname(__file__)
+    py_files = [f for f in _glob.glob(os.path.join(root, "*.py")) if f != os.path.join(root, "test_smoke.py")]
+    errors = []
+    for f in py_files:
+        try:
+            py_compile.compile(f, doraise=True)
+        except py_compile.PyCompileError as e:
+            errors.append(str(e))
+    if errors:
+        for err in errors:
+            print(f"COMPILE FAIL: {err}", flush=True)
+        sys.exit(1)
+    print(f"COMPILE OK: {len(py_files)} files", flush=True)
+
+
 # ── BackendManager tests (NEW) ────────────────────────────────────────
 
 def test_backend_manager_constructor():
@@ -1369,10 +1390,8 @@ def test_streaming_completion_releases_slot():
 
 
 if __name__ == "__main__":
-    test_backend_manager_constructor()
-    test_backend_manager_agent_client()
-    test_backend_manager_model_registration()
-    test_reconcile_meta_removes_orphans()
+    test_compile_all()
+    # Hashing import test (must run first — imports hashing.py at module level)
     test_hashing_imports()
     test_save_slot_response_parsing()
     test_cache_agent_client_delete_success()

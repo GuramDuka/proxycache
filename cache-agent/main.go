@@ -23,6 +23,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cache/delete", handleDelete)
+	mux.HandleFunc("/cache/files/", handleFileSizes)
 
 	addr := ":" + port
 	log.Printf("cache-agent listening on %s (CACHE_DIR=%s)\n", addr, cacheDir)
@@ -32,6 +33,11 @@ func main() {
 type deleteResponse struct {
 	Ok    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+}
+
+type fileResponse struct {
+	Size   int64 `json:"size"`
+	Exists bool  `json:"exists"`
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -71,4 +77,43 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(deleteResponse{Ok: true})
+}
+
+func handleFileSizes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(fileResponse{Exists: false})
+		return
+	}
+
+	basename := r.URL.Path[len("/cache/files/"):]
+	if basename == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(fileResponse{Exists: false})
+		return
+	}
+
+	filepath := cacheDir + "/" + basename
+
+	info, err := os.Stat(filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(fileResponse{Exists: false})
+			return
+		}
+		log.Printf("cache file info: failed to stat %s: %v\n", basename, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(fileResponse{Exists: false})
+		return
+	}
+
+	log.Printf("cache file size: %s size=%d\n", basename, info.Size())
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(fileResponse{Size: info.Size(), Exists: true})
 }

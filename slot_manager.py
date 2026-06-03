@@ -75,12 +75,7 @@ class SlotManager:
 
     def _evict_meta_file(self, key: str):
         """Delete the meta file for a cache entry."""
-        meta_path = os.path.join(META_DIR, f"{key}{hs.META_SUFFIX}")
-        if os.path.exists(meta_path):
-            try:
-                os.remove(meta_path)
-            except OSError:
-                pass
+        hs.delete_meta_file(key)
 
     def init_from_disk(self, cache_dir: str):
         """Populate ring buffer from existing cache files on disk."""
@@ -96,6 +91,28 @@ class SlotManager:
                     self._total_bytes += size
                 except OSError:
                     continue
+        # Also scan meta files in backend subdirectories to discover cached keys
+        if os.path.isdir(META_DIR):
+            for backend_dir in os.listdir(META_DIR):
+                backend_path = os.path.join(META_DIR, backend_dir)
+                if not os.path.isdir(backend_path):
+                    continue
+                for meta_file in os.listdir(backend_path):
+                    if not meta_file.endswith(hs.META_SUFFIX):
+                        continue
+                    key = meta_file.removesuffix(hs.META_SUFFIX)
+                    # Skip if already in ring buffer
+                    if any(entry[0] == key for entry in self._cache_ring):
+                        continue
+                    try:
+                        cache_path = os.path.join(cache_dir, key)
+                        if os.path.exists(cache_path):
+                            size = os.stat(cache_path).st_size
+                            last_used = hs._get_last_used_time(key, META_DIR, cache_dir, backend_dir)
+                            self._cache_ring.append((key, size, last_used, None))
+                            self._total_bytes += size
+                    except OSError:
+                        continue
         log.info("init_from_disk: %d cache files, %.1f GB total",
                   len(self._cache_ring), self._total_bytes / 1024**3)
 
@@ -277,20 +294,15 @@ class SlotManager:
                     if restored:
                         self._touch_ring(restore_key)
                         # Update tracked KV state with restored candidate blocks
-                        try:
-                            meta_path = os.path.join(META_DIR, f"{restore_key}{hs.META_SUFFIX}")
-                            if os.path.exists(meta_path):
-                                with open(meta_path, "r", encoding="utf-8") as mf:
-                                    meta = json.load(mf)
-                                self._slot_kv_state[g] = meta.get("blocks", [])
-                        except Exception as e:
-                            log.warning("restore_meta_load_fail key=%s: %s", restore_key[:16], e)
+                        blocks = hs.get_meta_blocks(restore_key, backend_id)
+                        if blocks is not None:
+                            self._slot_kv_state[g] = blocks
                 else:
                     # No pre-computed candidate and KV cache doesn't match —
                     # find best meta file to restore from
                     client = backend_manager.get_client(backend_id)
                     cand = hs.find_best_restore_candidate(
-                        blocks, WORDS_PER_BLOCK, LCP_TH, model_name,
+                        blocks, WORDS_PER_BLOCK, LCP_TH, model_name, backend_id,
                     )
                     if cand:
                         cand_key, cand_ratio = cand
@@ -300,14 +312,9 @@ class SlotManager:
                             model_name, backend_id, slot_id, cand_key[:16], cand_ratio, restored,
                         )
                         if restored:
-                            try:
-                                meta_path = os.path.join(META_DIR, f"{cand_key}{hs.META_SUFFIX}")
-                                if os.path.exists(meta_path):
-                                    with open(meta_path, "r", encoding="utf-8") as mf:
-                                        meta = json.load(mf)
-                                    self._slot_kv_state[g] = meta.get("blocks", [])
-                            except Exception as e:
-                                log.warning("restore_meta_load_fail key=%s: %s", cand_key[:16], e)
+                            blocks = hs.get_meta_blocks(cand_key, backend_id)
+                            if blocks is not None:
+                                self._slot_kv_state[g] = blocks
                     else:
                         log.info(
                             "restore_dynamic_none model=%s be=%s slot=%d",

@@ -1,13 +1,16 @@
 # cache_agent_client.py
 
 """
-HTTP client for cache-agent: POST /cache/delete?key=<basename>
+HTTP client for cache-agent:
+  - POST /cache/delete?key=<basename>
+  - GET  /cache/files/<basename>
 
 Each backend has its own cache-agent running on the same host as llama.cpp,
 typically on a separate port (e.g., 8082 vs 8080).
 """
 
 import logging
+from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
 import httpx
@@ -51,5 +54,52 @@ class CacheAgentClient:
 
         return True
 
+    async def get_file_size(self, key: str) -> Optional[Dict[str, Any]]:
+        """
+        Get file size and existence info for a cache file.
+
+        Args:
+            key: Cache file basename (the SHA256 key)
+
+        Returns:
+            {"size": int, "exists": True} if file exists,
+            {"exists": False} if not found,
+            None on connection error.
+        """
+        url = urljoin(self.base_url + "/", f"/cache/files/{key}")
+        try:
+            resp = await self._client.get(url)
+        except Exception as e:
+            log.warning("cache_agent_size_error url=%s key=%s: %s",
+                        self.base_url, key[:16], e)
+            return None
+
+        if resp.status_code == 404:
+            return {"exists": False}
+        if resp.status_code != 200:
+            log.warning("cache_agent_size_status=%d key=%s body=%s",
+                        resp.status_code, key[:16], resp.text[:200])
+            return None
+
+        return resp.json()
+
     async def close(self):
         await self._client.aclose()
+
+
+async def get_file_size(agent_url: str, key: str) -> Optional[Dict[str, Any]]:
+    """
+    Module-level convenience function to get file size from a cache agent.
+
+    Args:
+        agent_url: Agent URL, e.g. "http://10.0.0.1:8082"
+        key: Cache file basename (the SHA256 key)
+
+    Returns:
+        {"size": int, "exists": True} or {"exists": False} or None on error.
+    """
+    client = CacheAgentClient(agent_url)
+    try:
+        return await client.get_file_size(key)
+    finally:
+        await client.close()
