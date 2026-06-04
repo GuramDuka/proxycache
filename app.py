@@ -441,7 +441,7 @@ async def chat(req: Request):
     body["cache_prompt"] = True
 
     log.info(
-        "Dispatching request: model '%s' on backend '%s' slot %d, big=%s, restore=%s, restored=%s",
+        "Dispatching request from client %s: model '%s' on backend '%s' slot %d, big=%s, restore=%s, restored=%s",
         client_ip,
         model_name,
         be_id,
