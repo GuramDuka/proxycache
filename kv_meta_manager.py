@@ -231,11 +231,8 @@ async def reconcile_meta(meta_base: str, cache_dir: str, backend_keys: Optional[
 
                 # Check for orphaned meta files (no matching cache on disk)
                 cache_exists = False
-                meta_cache_size = meta.get("cache_size", 0)
 
-                if meta_cache_size and meta_cache_size > 0:
-                    cache_exists = True
-                elif agent_url:
+                if agent_url:
                     try:
                         from cache_agent_client import get_file_size
                         result = await get_file_size(agent_url, cachename)
