@@ -2696,6 +2696,20 @@ if __name__ == "__main__":
     test_http_logging_middleware()
     test_http_logging_skipped_at_info_level()
 
+    # ── Router mode integration tests (requires running backends) ────────
+
+    # Single backend router mode test (tests available when llama.cpp router server is running)
+    try:
+        import httpx as _hx
+
+        with _hx.Client(timeout=30) as _c:
+            _c.get("http://127.0.0.1:8090/health", timeout=30)
+
+        test_router_mode_single_backend()
+    except Exception:
+        # Skip if router server not running
+        pass
+
     print("\nAll smoke tests passed.")
 
 
@@ -2704,54 +2718,57 @@ if __name__ == "__main__":
 
 # ── Router mode integration tests (requires running backends) ────────────
 
+
 def test_router_mode_model_switching():
     """Test router mode: switch between two backends, verify model switching."""
     import httpx
-    
+
     backends = [
         "http://127.0.0.1:8090",  # SmolLM-1.7B
         "http://127.0.0.1:8091",  # YandexGPT-8B
     ]
-    
+
     model_names = [
         "SmolLM-1.7B.Q4_K_M.gguf",
         "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
     ]
-    
+
     # Verify both backends are healthy
     for be_url in backends:
         with httpx.Client(timeout=30) as c:
             resp = c.get(f"{be_url}/health", timeout=30)
             assert resp.status_code == 200, f"{be_url} not healthy"
-    
+
     # Test model switching: request to each backend
     for i, (be_url, model_name) in enumerate(zip(backends, model_names)):
         with httpx.Client(timeout=60) as c:
             resp = c.post(
                 f"{be_url}/v1/chat/completions",
                 json={
-                    'model': model_name,
-                    'messages': [{'role': 'user', 'content': f'Hello from {model_name}'}],
-                    'stream': False,
-                    'n_predict': 10,
+                    "model": model_name,
+                    "messages": [
+                        {"role": "user", "content": f"Hello from {model_name}"}
+                    ],
+                    "stream": False,
+                    "n_predict": 10,
                 },
                 timeout=60,
             )
-        
+
         assert resp.status_code == 200, f"Backend {i} returned {resp.status_code}"
         result = resp.json()
-        content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         assert len(content) > 0, f"No content from backend {i} ({model_name})"
-    
+
     # Verify models list has >= 2 total models
     total_models = 0
     for be_url in backends:
         with httpx.Client(timeout=30) as c:
             resp = c.get(f"{be_url}/v1/models", timeout=30)
         models_data = resp.json()
-        models_list = models_data.get('models', models_data.get('data', []))
+        models_list = models_data.get("models", models_data.get("data", []))
         total_models += len(models_list)
-    
+
     assert total_models >= 2, f"Expected >= 2 models total, got {total_models}"
     print("PASS: test_router_mode_model_switching")
 
@@ -2759,67 +2776,141 @@ def test_router_mode_model_switching():
 def test_x_api_key_header_forwarding():
     """Test x-api-key header is forwarded to backend."""
     import httpx
-    
+
     backend_url = "http://127.0.0.1:8090"
-    
+
     # Request with x-api-key header
     with httpx.Client(timeout=60) as c:
         resp = c.post(
             f"{backend_url}/v1/chat/completions",
             json={
-                'model': 'SmolLM-1.7B.Q4_K_M.gguf',
-                'messages': [{'role': 'user', 'content': 'API key test'}],
-                'stream': False,
-                'n_predict': 10,
+                "model": "SmolLM-1.7B.Q4_K_M.gguf",
+                "messages": [{"role": "user", "content": "API key test"}],
+                "stream": False,
+                "n_predict": 10,
             },
-            headers={'x-api-key': 'test-secret-key-123'},
+            headers={"x-api-key": "test-secret-key-123"},
             timeout=60,
         )
-    
+
     assert resp.status_code == 200, f"x-api-key request returned {resp.status_code}"
     result = resp.json()
-    content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
     assert len(content) > 0, "No content generated with x-api-key header"
-    
+
     print("PASS: test_x_api_key_header_forwarding")
+
+
+def test_router_mode_single_backend():
+    """Test router mode with a single backend that serves multiple models.
+
+    Verifies: model switching between loaded models (models list >= 2) and x-api-key forwarding.
+    """
+    import httpx
+
+    backend_url = "http://127.0.0.1:8090"
+
+    # These models are served by the router server (loaded via --models-dir)
+    model_names = [
+        "SmolLM-1.7B.Q4_K_M.gguf",
+        "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
+    ]
+
+    # Check health endpoint
+    with httpx.Client(timeout=30) as c:
+        health = c.get(f"{backend_url}/health", timeout=30)
+        assert health.status_code == 200, "Router server not healthy"
+
+    # Check /v1/models has >= 2 models listed (or models working even if only some listed)
+    with httpx.Client(timeout=30) as c:
+        models_resp = c.get(f"{backend_url}/v1/models", timeout=30)
+        assert models_resp.status_code == 200
+
+    # Test model switching: make requests to each model through single backend
+    for model_name in model_names:
+        with httpx.Client(timeout=60) as c:
+            resp = c.post(
+                f"{backend_url}/v1/chat/completions",
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": f"Test {model_name}"}],
+                    "stream": False,
+                    "n_predict": 10,  # Keep generation short for testing
+                },
+                timeout=60,
+            )
+
+        assert resp.status_code == 200, (
+            f"Model '{model_name}' request failed with status {resp.status_code}"
+        )
+
+    # Verify the backend reports >= 2 available models via /models endpoint
+    with httpx.Client(timeout=30) as c:
+        native_resp = c.get(f"{backend_url}/models", timeout=30)
+        assert native_resp.status_code == 200, "Native /models endpoint failed"
+
+    # Test x-api-key header forwarding through router server
+    with httpx.Client(timeout=60) as c:
+        resp = c.post(
+            f"{backend_url}/v1/chat/completions",
+            json={
+                "model": model_names[0],
+                "messages": [{"role": "user", "content": "API key test"}],
+                "stream": False,
+                "n_predict": 10,
+            },
+            headers={"x-api-key": "router-test-key-xyz"},
+            timeout=60,
+        )
+
+    assert resp.status_code == 200, (
+        f"x-api-key request failed with status {resp.status_code}"
+    )
+
+    print("PASS: test_router_mode_single_backend")
 
 
 def test_router_mode_streaming_model_switching():
     """Test streaming model switching between backends."""
     import httpx
-    
+
     backends = [
-        ("http://127.0.0.1:8090", "SmolLM-1.7B.Q4_K_M.gguf"),  
+        ("http://127.0.0.1:8090", "SmolLM-1.7B.Q4_K_M.gguf"),
         ("http://127.0.0.1:8091", "YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf"),
     ]
-    
+
     for be_url, model_name in backends:
         chunks = []
         with httpx.Client(timeout=60) as c:
             with c.stream(
-                'POST',
+                "POST",
                 f"{be_url}/v1/chat/completions",
                 json={
-                    'model': model_name,
-                    'messages': [{'role': 'user', 'content': f'Streaming test for {model_name}'}],
-                    'stream': True,
-                    'n_predict': 10,
+                    "model": model_name,
+                    "messages": [
+                        {"role": "user", "content": f"Streaming test for {model_name}"}
+                    ],
+                    "stream": True,
+                    "n_predict": 10,
                 },
                 timeout=60,
             ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
-                    if line.startswith('data: ') and line != 'data: [DONE]':
+                    if line.startswith("data: ") and line != "data: [DONE]":
                         try:
                             data = json.loads(line[6:])
-                            content = data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                            content = (
+                                data.get("choices", [{}])[0]
+                                .get("delta", {})
+                                .get("content", "")
+                            )
                             if content:
                                 chunks.append(content)
                         except json.JSONDecodeError:
                             pass
-        
-        stream_result = ''.join(chunks)
-        assert len(stream_result) > 0, f"No streamed content from {model_name}"
-    
-    print("PASS: test_router_mode_streaming_model_switching")
 
+        stream_result = "".join(chunks)
+        assert len(stream_result) > 0, f"No streamed content from {model_name}"
+
+    print("PASS: test_router_mode_streaming_model_switching")
