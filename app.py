@@ -48,6 +48,7 @@ from config import (
     SLOT_TIMEOUT,
     DEFAULT_N_CTX,
     CACHE_SAVE_RATIO_THRESHOLD,
+    LOG_LEVEL,
 )
 
 import hashing as hs
@@ -64,6 +65,53 @@ STREAM_QUEUE_TIMEOUT = 5.0
 RECOMPUTE_THRESHOLD_PERCENT_REQ_TOKENS = 0.92
 
 app = FastAPI(title="Simple KV Proxy")
+
+_http_log = logging.getLogger("http")
+
+
+@app.middleware("http")
+async def log_http_requests(req: Request, call_next):
+    """Log HTTP request/response headers for all endpoints when LOG_LEVEL >= DEBUG."""
+    if LOG_LEVEL.upper() not in ("DEBUG", "TRACE"):
+        return await call_next(req)
+
+    t0 = time.time()
+    client_ip = req.client.host if req.client else "-"
+    method = req.method
+    path = req.url.path
+
+    # Log request
+    _http_log.debug(
+        "HTTP %s %s from %s",
+        method,
+        path,
+        client_ip,
+    )
+
+    resp = await call_next(req)
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    # Log response
+    try:
+        status = resp.status_code
+    except Exception:
+        status = "?"
+    try:
+        resp_headers = dict(resp.headers)
+    except Exception:
+        resp_headers = "?"
+
+    _http_log.debug(
+        "HTTP %s %s -> %d (%dms) headers=%s",
+        method,
+        path,
+        status,
+        elapsed_ms,
+        resp_headers,
+    )
+
+    return resp
 
 
 @app.on_event("startup")

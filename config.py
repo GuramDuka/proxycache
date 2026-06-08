@@ -70,7 +70,22 @@ BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
 
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FILE = os.getenv("LOG_FILE", "")
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+)
+
+_file_handler = None
+if LOG_FILE:
+    _file_handler = logging.FileHandler(LOG_FILE)
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+
 logging.basicConfig(
     level=LOG_LEVEL.upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[_console_handler] + ([_file_handler] if _file_handler else []),
+    force=True,
 )

@@ -14,12 +14,18 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Compile check ─────────────────────────────────────────────────────
 
+
 def test_compile_all():
     """Verify all project Python files compile without errors."""
     import py_compile
     import glob as _glob
+
     root = os.path.dirname(__file__)
-    py_files = [f for f in _glob.glob(os.path.join(root, "*.py")) if f != os.path.join(root, "test_smoke.py")]
+    py_files = [
+        f
+        for f in _glob.glob(os.path.join(root, "*.py"))
+        if f != os.path.join(root, "test_smoke.py")
+    ]
     errors = []
     for f in py_files:
         try:
@@ -35,10 +41,11 @@ def test_compile_all():
 
 # ── BackendManager tests (NEW) ────────────────────────────────────────
 
+
 def test_backend_manager_constructor():
     """BackendManager should derive keys from URLs and create clients."""
     from backend_manager import BackendManager, BackendInfo
-    
+
     bm = BackendManager([{"url": "http://10.0.0.1:8000"}])
     assert bm.keys() == ["10.0.0.1:8000"]
     assert bm.first_key() == "10.0.0.1:8000"
@@ -51,7 +58,7 @@ def test_backend_manager_agent_client():
     """BackendManager should create agent clients when agent_port is configured."""
     from backend_manager import BackendManager
     from cache_agent_client import CacheAgentClient
-    
+
     bm = BackendManager([{"url": "http://10.0.0.1:8000", "agent_port": 8082}])
     agent = bm.get_agent("10.0.0.1:8000")
     assert isinstance(agent, CacheAgentClient)
@@ -62,18 +69,20 @@ def test_backend_manager_model_registration():
     """BackendManager should register backends for models via discover_models."""
     from backend_manager import BackendManager
     from unittest.mock import AsyncMock
-    
+
     bm = BackendManager([{"url": "http://10.0.0.1:8000"}])
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    bm._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
-    
+    bm._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
+
     async def _run():
         await bm.discover_models()
         await bm.refresh_slot_counts()
         return bm.get_discovered_models("ModelA")
-    
+
     result = asyncio.run(_run())
     assert len(result) == 1
     assert result[0].name == "ModelA"
@@ -86,9 +95,11 @@ def test_backend_manager_model_registration():
 
 # ── hashing tests (unchanged) ────────────────────────────────────────
 
+
 def test_reconcile_meta_removes_orphans():
     """reconcile_meta should delete meta files with no matching cache and skip valid ones."""
     from kv_meta_manager import KVMetaManager
+
     mgr = KVMetaManager()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -102,12 +113,16 @@ def test_reconcile_meta_removes_orphans():
         with open(os.path.join(cache_dir, valid_key), "w") as f:
             f.write("cache data")
         with open(os.path.join(meta_dir, f"{valid_key}.meta.json"), "w") as f:
-            json.dump({"key": valid_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
+            json.dump(
+                {"key": valid_key, "model_id": "test", "wpb": 100, "blocks": []}, f
+            )
 
         # Orphaned entry: meta exists but cache does not
         orphan_key = "orphan_cache_key"
         with open(os.path.join(meta_dir, f"{orphan_key}.meta.json"), "w") as f:
-            json.dump({"key": orphan_key, "model_id": "test", "wpb": 100, "blocks": []}, f)
+            json.dump(
+                {"key": orphan_key, "model_id": "test", "wpb": 100, "blocks": []}, f
+            )
 
         # Corrupted meta file
         corrupted_key = "corrupted_cache_key"
@@ -117,9 +132,15 @@ def test_reconcile_meta_removes_orphans():
         deleted = asyncio.run(reconcile_meta(meta_dir, cache_dir))
 
         assert deleted == 2, f"Expected 2 deleted (orphan + corrupted), got {deleted}"
-        assert os.path.exists(os.path.join(meta_dir, f"{valid_key}.meta.json")), "Valid meta was deleted"
-        assert not os.path.exists(os.path.join(meta_dir, f"{orphan_key}.meta.json")), "Orphan meta was not deleted"
-        assert not os.path.exists(os.path.join(meta_dir, f"{corrupted_key}.meta.json")), "Corrupted meta was not deleted"
+        assert os.path.exists(os.path.join(meta_dir, f"{valid_key}.meta.json")), (
+            "Valid meta was deleted"
+        )
+        assert not os.path.exists(os.path.join(meta_dir, f"{orphan_key}.meta.json")), (
+            "Orphan meta was not deleted"
+        )
+        assert not os.path.exists(
+            os.path.join(meta_dir, f"{corrupted_key}.meta.json")
+        ), "Corrupted meta was not deleted"
         print("PASS: test_reconcile_meta_removes_orphans")
 
 
@@ -127,6 +148,7 @@ def test_hashing_imports():
     """hashing module should have hashing functions; kv-meta in kv_meta_manager."""
     import hashing as hs
     from kv_meta_manager import KVMetaManager
+
     assert hasattr(hs, "block_hashes_from_tokens")
     assert hasattr(hs, "lcp_blocks")
     assert hasattr(hs, "meta_key")
@@ -165,7 +187,9 @@ def test_cache_agent_client_delete_success():
     async def run():
         client = CacheAgentClient("http://10.0.0.1:8082")
         mock_resp = await _mock_cache_agent_success("test_key")
-        with patch.object(client._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            client._client, "post", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await client.delete("test_key")
             assert result is True, f"Expected True, got {result}"
         await client.close()
@@ -182,7 +206,9 @@ def test_cache_agent_client_delete_failure():
     async def run():
         client = CacheAgentClient("http://10.0.0.1:8082")
         mock_resp = await _mock_cache_agent_failure("test_key")
-        with patch.object(client._client, "post", new_callable=AsyncMock, return_value=mock_resp):
+        with patch.object(
+            client._client, "post", new_callable=AsyncMock, return_value=mock_resp
+        ):
             result = await client.delete("test_key")
             assert result is False, f"Expected False, got {result}"
         await client.close()
@@ -199,8 +225,12 @@ def test_cache_agent_client_connect_error():
     async def run():
         bm = BackendManager([{"url": "http://10.0.0.1:9999", "agent_port": 8082}])
         agent = bm.get_agent("10.0.0.1-9999")
-        with patch.object(agent._client, "post", new_callable=AsyncMock,
-                          side_effect=httpx.ConnectError("connection refused")):
+        with patch.object(
+            agent._client,
+            "post",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("connection refused"),
+        ):
             result = await agent.delete("test_key")
             assert result is False, f"Expected False, got {result}"
         await agent.close()
@@ -212,9 +242,11 @@ def test_cache_agent_client_connect_error():
 def test_save_slot_response_parsing():
     """save_slot must extract n_written from the llama.cpp save response."""
     mock_response_json = {
-        "id_slot": 0, "filename": "test_cache",
-        "n_saved": 1745, "n_written": 14309796,
-        "timings": {"save_ms": 49.865}
+        "id_slot": 0,
+        "filename": "test_cache",
+        "n_saved": 1745,
+        "n_written": 14309796,
+        "timings": {"save_ms": 49.865},
     }
     data = mock_response_json
     n_written = data.get("n_written", 0)
@@ -228,6 +260,7 @@ def test_save_slot_response_parsing():
 
 # ── SlotManager tests ────────────────────────────────────────────────
 
+
 def test_slot_manager_per_model_pools():
     """SlotManager should create separate pools per model."""
     from slot_manager import SlotManager, GSlot
@@ -238,8 +271,12 @@ def test_slot_manager_per_model_pools():
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 3)
 
-    assert ("ModelA", "10.0.0.1:8000") in sm._slot_pools, f"ModelA not in pools: {sm._slot_pools}"
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1, 2}, f"Got {sm._slot_pools}"
+    assert ("ModelA", "10.0.0.1:8000") in sm._slot_pools, (
+        f"ModelA not in pools: {sm._slot_pools}"
+    )
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1, 2}, (
+        f"Got {sm._slot_pools}"
+    )
     print("PASS: test_slot_manager_per_model_pools")
 
 
@@ -254,8 +291,12 @@ def test_slot_manager_multiple_models():
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
     sm._ensure_pool("ModelB", "10.0.0.1:8000", 4)
 
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
-    assert sm._slot_pools[("ModelB", "10.0.0.1:8000")] == {0, 1, 2, 3}, f"Got {sm._slot_pools.get('ModelB', {})}"
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
+    assert sm._slot_pools[("ModelB", "10.0.0.1:8000")] == {0, 1, 2, 3}, (
+        f"Got {sm._slot_pools.get('ModelB', {})}"
+    )
     print("PASS: test_slot_manager_multiple_models")
 
 
@@ -300,11 +341,15 @@ def test_slot_manager_pool_resize_up():
 
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
 
     # Resize to 4
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 4)
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1, 2, 3}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1, 2, 3}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
     print("PASS: test_slot_manager_pool_resize_up")
 
 
@@ -326,7 +371,9 @@ def test_slot_manager_pool_resize_down():
 
     # Resize to 2
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
     # Slot 2 was used, so it should NOT be in the pool anymore (it was removed)
     # but last_used may still have the entry (that's OK — it'll be cleaned on next acquire)
     print("PASS: test_slot_manager_pool_resize_down")
@@ -346,8 +393,12 @@ def test_slot_manager_multiple_backends():
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 2)
     sm._ensure_pool("ModelA", "10.0.0.2:8000", 3)
 
-    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, f"Got {sm._slot_pools.get('ModelA', {})}"
-    assert sm._slot_pools[("ModelA", "10.0.0.2:8000")] == {0, 1, 2}, f"Got {sm._slot_pools.get('ModelA', {})}"
+    assert sm._slot_pools[("ModelA", "10.0.0.1:8000")] == {0, 1}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
+    assert sm._slot_pools[("ModelA", "10.0.0.2:8000")] == {0, 1, 2}, (
+        f"Got {sm._slot_pools.get('ModelA', {})}"
+    )
     print("PASS: test_slot_manager_multiple_backends")
 
 
@@ -365,6 +416,7 @@ def test_slot_manager_gslot_type():
 
 def test_ring_buffer_age_eviction():
     from collections import deque
+
     """Ring buffer should evict expired entries before LRU entries when over limit."""
     from slot_manager import SlotManager
     import hashing as hs
@@ -385,21 +437,25 @@ def test_ring_buffer_age_eviction():
         size = 1024 * 1024 * 1020  # ~1 GB each
         max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
 
-        sm._cache_ring.setdefault('test_be', deque()).append((old_key, size, time.time() - 7200))  # 2 hours old
-        sm._cache_ring.setdefault('test_be', deque()).append((new_key, size, time.time() - 300))   # 5 minutes old
-        sm._total_bytes['test_be'] = size * 2
+        sm._cache_ring.setdefault("test_be", deque()).append(
+            (old_key, size, time.time() - 7200)
+        )  # 2 hours old
+        sm._cache_ring.setdefault("test_be", deque()).append(
+            (new_key, size, time.time() - 300)
+        )  # 5 minutes old
+        sm._total_bytes["test_be"] = size * 2
 
         # Trigger eviction (simulating save_after behavior)
         now = time.time()
         evicted = []
-        while sm._total_bytes.get('test_be', 0) > max_bytes and sm._cache_ring:
+        while sm._total_bytes.get("test_be", 0) > max_bytes and sm._cache_ring:
             # First pass: evict expired entries
             evicted_expired = False
-            for entry in sm._cache_ring['test_be']:
+            for entry in sm._cache_ring["test_be"]:
                 if now - entry[2] > sm._max_age_seconds:
                     evict_key, evict_size, _ = entry
-                    sm._cache_ring['test_be'].remove(entry)
-                    sm._total_bytes['test_be'] -= evict_size
+                    sm._cache_ring["test_be"].remove(entry)
+                    sm._total_bytes["test_be"] -= evict_size
                     evicted.append(evict_key)
                     evicted_expired = True
                     break
@@ -408,20 +464,20 @@ def test_ring_buffer_age_eviction():
 
             # Second pass: evict LRU entry
             lru_idx = 0
-            lru_ts = sm._cache_ring['test_be'][0][2]
-            for i in range(1, len(sm._cache_ring['test_be'])):
-                if sm._cache_ring['test_be'][i][2] < lru_ts:
-                    lru_ts = sm._cache_ring['test_be'][i][2]
+            lru_ts = sm._cache_ring["test_be"][0][2]
+            for i in range(1, len(sm._cache_ring["test_be"])):
+                if sm._cache_ring["test_be"][i][2] < lru_ts:
+                    lru_ts = sm._cache_ring["test_be"][i][2]
                     lru_idx = i
-            evict_key, evict_size, _ = sm._cache_ring['test_be'][lru_idx]
-            sm._cache_ring['test_be'].remove(sm._cache_ring['test_be'][lru_idx])
-            sm._total_bytes['test_be'] -= evict_size
+            evict_key, evict_size, _ = sm._cache_ring["test_be"][lru_idx]
+            sm._cache_ring["test_be"].remove(sm._cache_ring["test_be"][lru_idx])
+            sm._total_bytes["test_be"] -= evict_size
             evicted.append(evict_key)
 
         assert evicted == [old_key], f"Expected [old_key], got {evicted}"
-        assert sm._total_bytes['test_be'] == size  # Only old entry removed
-        assert len(sm._cache_ring['test_be']) == 1
-        assert sm._cache_ring['test_be'][0][0] == new_key
+        assert sm._total_bytes["test_be"] == size  # Only old entry removed
+        assert len(sm._cache_ring["test_be"]) == 1
+        assert sm._cache_ring["test_be"][0][0] == new_key
         print("PASS: test_ring_buffer_age_eviction")
 
 
@@ -437,20 +493,24 @@ def test_ring_buffer_lru_eviction():
     max_bytes = 1500 * 1024 * 1024  # 1.5 GB limit
 
     # Simulate ring buffer with all entries under max age
-    sm._cache_ring.setdefault('test_be', deque()).append(("cache_a", size, time.time() - 1800))  # 30 min old
-    sm._cache_ring.setdefault('test_be', deque()).append(("cache_b", size, time.time() - 600))   # 10 min old
-    sm._total_bytes['test_be'] = size * 2
+    sm._cache_ring.setdefault("test_be", deque()).append(
+        ("cache_a", size, time.time() - 1800)
+    )  # 30 min old
+    sm._cache_ring.setdefault("test_be", deque()).append(
+        ("cache_b", size, time.time() - 600)
+    )  # 10 min old
+    sm._total_bytes["test_be"] = size * 2
 
     # Trigger eviction
     now = time.time()
     evicted = []
-    while sm._total_bytes.get('test_be', 0) > max_bytes and sm._cache_ring:
+    while sm._total_bytes.get("test_be", 0) > max_bytes and sm._cache_ring:
         evicted_expired = False
-        for entry in sm._cache_ring['test_be']:
+        for entry in sm._cache_ring["test_be"]:
             if now - entry[2] > sm._max_age_seconds:
                 evict_key, evict_size, _ = entry
-                sm._cache_ring['test_be'].remove(entry)
-                sm._total_bytes['test_be'] -= evict_size
+                sm._cache_ring["test_be"].remove(entry)
+                sm._total_bytes["test_be"] -= evict_size
                 evicted.append(evict_key)
                 evicted_expired = True
                 break
@@ -458,20 +518,20 @@ def test_ring_buffer_lru_eviction():
             continue
 
         lru_idx = 0
-        lru_ts = sm._cache_ring['test_be'][0][2]
-        for i in range(1, len(sm._cache_ring['test_be'])):
-            if sm._cache_ring['test_be'][i][2] < lru_ts:
-                lru_ts = sm._cache_ring['test_be'][i][2]
+        lru_ts = sm._cache_ring["test_be"][0][2]
+        for i in range(1, len(sm._cache_ring["test_be"])):
+            if sm._cache_ring["test_be"][i][2] < lru_ts:
+                lru_ts = sm._cache_ring["test_be"][i][2]
                 lru_idx = i
-        evict_key, evict_size, _ = sm._cache_ring['test_be'][lru_idx]
-        sm._cache_ring['test_be'].remove(sm._cache_ring['test_be'][lru_idx])
-        sm._total_bytes['test_be'] -= evict_size
+        evict_key, evict_size, _ = sm._cache_ring["test_be"][lru_idx]
+        sm._cache_ring["test_be"].remove(sm._cache_ring["test_be"][lru_idx])
+        sm._total_bytes["test_be"] -= evict_size
         evicted.append(evict_key)
 
     assert evicted == ["cache_a"], f"Expected [cache_a] (LRU), got {evicted}"
-    assert sm._total_bytes['test_be'] == size
-    assert len(sm._cache_ring['test_be']) == 1
-    assert sm._cache_ring['test_be'][0][0] == "cache_b"
+    assert sm._total_bytes["test_be"] == size
+    assert len(sm._cache_ring["test_be"]) == 1
+    assert sm._cache_ring["test_be"][0][0] == "cache_b"
     print("PASS: test_ring_buffer_lru_eviction")
 
 
@@ -486,19 +546,23 @@ def test_ring_buffer_no_eviction_under_limit():
     size = 1024 * 1024 * 1020  # ~1 GB
     max_bytes = 2 * 1024 * 1024 * 1024  # 2 GB limit
 
-    sm._cache_ring.setdefault('test_be', deque()).append(("cache_a", size, time.time() - 1800))
-    sm._cache_ring.setdefault('test_be', deque()).append(("cache_b", size, time.time() - 600))
-    sm._total_bytes['test_be'] = size * 2
+    sm._cache_ring.setdefault("test_be", deque()).append(
+        ("cache_a", size, time.time() - 1800)
+    )
+    sm._cache_ring.setdefault("test_be", deque()).append(
+        ("cache_b", size, time.time() - 600)
+    )
+    sm._total_bytes["test_be"] = size * 2
 
     now = time.time()
     evicted = []
-    while sm._total_bytes.get('test_be', 0) > max_bytes and sm._cache_ring:
+    while sm._total_bytes.get("test_be", 0) > max_bytes and sm._cache_ring:
         evicted_expired = False
-        for entry in sm._cache_ring['test_be']:
+        for entry in sm._cache_ring["test_be"]:
             if now - entry[2] > sm._max_age_seconds:
                 evict_key, evict_size, _ = entry
-                sm._cache_ring['test_be'].remove(entry)
-                sm._total_bytes['test_be'] -= evict_size
+                sm._cache_ring["test_be"].remove(entry)
+                sm._total_bytes["test_be"] -= evict_size
                 evicted.append(evict_key)
                 evicted_expired = True
                 break
@@ -506,23 +570,24 @@ def test_ring_buffer_no_eviction_under_limit():
             continue
 
         lru_idx = 0
-        lru_ts = sm._cache_ring['test_be'][0][2]
-        for i in range(1, len(sm._cache_ring['test_be'])):
-            if sm._cache_ring['test_be'][i][2] < lru_ts:
-                lru_ts = sm._cache_ring['test_be'][i][2]
+        lru_ts = sm._cache_ring["test_be"][0][2]
+        for i in range(1, len(sm._cache_ring["test_be"])):
+            if sm._cache_ring["test_be"][i][2] < lru_ts:
+                lru_ts = sm._cache_ring["test_be"][i][2]
                 lru_idx = i
-        evict_key, evict_size, _ = sm._cache_ring['test_be'][lru_idx]
-        sm._cache_ring['test_be'].remove(sm._cache_ring['test_be'][lru_idx])
-        sm._total_bytes['test_be'] -= evict_size
+        evict_key, evict_size, _ = sm._cache_ring["test_be"][lru_idx]
+        sm._cache_ring["test_be"].remove(sm._cache_ring["test_be"][lru_idx])
+        sm._total_bytes["test_be"] -= evict_size
         evicted.append(evict_key)
 
     assert evicted == [], f"Expected no evictions, got {evicted}"
-    assert sm._total_bytes['test_be'] == size * 2
-    assert len(sm._cache_ring['test_be']) == 2
+    assert sm._total_bytes["test_be"] == size * 2
+    assert len(sm._cache_ring["test_be"]) == 2
     print("PASS: test_ring_buffer_no_eviction_under_limit")
 
 
 # ── KV cache skip tests ──────────────────────────────────────────────
+
 
 def test_should_skip_restore_no_tracked_state():
     """_should_skip_restore should return False when no state tracked for slot."""
@@ -659,21 +724,31 @@ def test_save_after_updates_slot_kv_state():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     blocks = ["blk_a", "blk_b", "blk_c"]
 
     async def _run():
         ok, size = await sm.save_after(
-            "ModelA", "10.0.0.1:8000", 0, "test_key", blocks,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            blocks,
         )
         return ok
 
     asyncio.run(_run())
 
     assert mock_client.save_slot.call_count == 1
-    assert ("ModelA", "10.0.0.1:8000", 0) in sm._slot_kv_state, f"Got {sm._slot_kv_state}"
-    assert sm._slot_kv_state[("ModelA", "10.0.0.1:8000", 0)] == blocks, f"Got {sm._slot_kv_state.get(('ModelA', '10.0.0.1:8000', 0))}"
+    assert ("ModelA", "10.0.0.1:8000", 0) in sm._slot_kv_state, (
+        f"Got {sm._slot_kv_state}"
+    )
+    assert sm._slot_kv_state[("ModelA", "10.0.0.1:8000", 0)] == blocks, (
+        f"Got {sm._slot_kv_state.get(('ModelA', '10.0.0.1:8000', 0))}"
+    )
     print("PASS: test_save_after_updates_slot_kv_state")
 
 
@@ -691,21 +766,30 @@ def test_save_after_no_blocks_no_state_update():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         ok, size = await sm.save_after(
-            "ModelA", "10.0.0.1:8000", 0, "test_key", None,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            None,
         )
         return ok
 
     asyncio.run(_run())
 
-    assert ("ModelA", "10.0.0.1:8000", 0) not in sm._slot_kv_state, f"Got {sm._slot_kv_state}"
+    assert ("ModelA", "10.0.0.1:8000", 0) not in sm._slot_kv_state, (
+        f"Got {sm._slot_kv_state}"
+    )
     print("PASS: test_save_after_no_blocks_no_state_update")
 
 
 # ── Bug reproduction tests (fail before fix, pass after) ────────────
+
 
 def test_restore_slot_times_out_on_slow_backend():
     """Behavioral: restore_slot returns False when backend doesn't respond in time."""
@@ -720,6 +804,7 @@ def test_restore_slot_times_out_on_slow_backend():
         llama_client.SLOT_TIMEOUT = 0.1
 
         try:
+
             async def slow_post(*a, **kw):
                 await asyncio.sleep(5)
                 return AsyncMock(status_code=200)
@@ -729,7 +814,9 @@ def test_restore_slot_times_out_on_slow_backend():
             result = await client.restore_slot(0, "test_key")
             elapsed = time.monotonic() - t0
             assert not result, "restore_slot should return False on timeout"
-            assert 0.05 < elapsed < 2, f"Should have timed out near 0.1s, took {elapsed:.1f}s"
+            assert 0.05 < elapsed < 2, (
+                f"Should have timed out near 0.1s, took {elapsed:.1f}s"
+            )
         finally:
             llama_client.SLOT_TIMEOUT = orig_timeout
 
@@ -751,11 +838,9 @@ def test_save_slot_returns_false_on_exception():
         ok, size = await client.save_slot(0, "test_key")
         assert not ok, "save_slot should return False on exception"
         assert size == 0, "save_slot should return 0 size on exception"
+
     asyncio.run(_run())
     print("PASS: test_save_slot_returns_false_on_exception")
-
-
-
 
 
 def test_adaptive_cooldown_on_failure():
@@ -770,7 +855,9 @@ def test_adaptive_cooldown_on_failure():
     mock_client = AsyncMock()
     mock_client.get_slots_info = AsyncMock(side_effect=Exception("connection refused"))
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         # First discover models to populate _discovered_models
@@ -784,9 +871,13 @@ def test_adaptive_cooldown_on_failure():
     refresh_key = ("ModelA", "10.0.0.1:8000")
     last_refresh = backend_manager._refresh_state.get(refresh_key)
     assert last_refresh is not None, "Cooldown was not set after failure"
-    assert isinstance(last_refresh, tuple), f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
+    assert isinstance(last_refresh, tuple), (
+        f"Expected (timestamp, success) tuple, got {type(last_refresh)}"
+    )
     timestamp, success = last_refresh
-    assert success is False, f"Expected success=False after failure, got success={success}"
+    assert success is False, (
+        f"Expected success=False after failure, got success={success}"
+    )
     assert timestamp > 0
     print("PASS: test_adaptive_cooldown_on_failure")
 
@@ -805,19 +896,26 @@ def test_lock_released_on_restore_failure():
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
-        name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
-        total_slots=1, last_discovered=0.0,
+        name="ModelA",
+        n_ctx=4096,
+        backends=["10.0.0.1:8000"],
+        total_slots=1,
+        last_discovered=0.0,
     )
 
     mock_client = AsyncMock()
     mock_client.restore_slot = AsyncMock(side_effect=Exception("connection refused"))
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.discover_models = AsyncMock(return_value=[("ModelA", 4096)])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         try:
-            await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")], restore_key="bad_key", blocks=["a", "b"])
+            await sm.acquire_for_request(
+                [("10.0.0.1:8000", "ModelA")], restore_key="bad_key", blocks=["a", "b"]
+            )
         except Exception:
             pass
 
@@ -837,9 +935,12 @@ def test_slot_timeout_config():
     old = os.environ.pop("SLOT_TIMEOUT", None)
     try:
         import config
+
         importlib.reload(config)
         assert hasattr(config, "SLOT_TIMEOUT"), "config.py should define SLOT_TIMEOUT"
-        assert config.SLOT_TIMEOUT == 30.0, f"Expected SLOT_TIMEOUT=30.0, got {config.SLOT_TIMEOUT}"
+        assert config.SLOT_TIMEOUT == 30.0, (
+            f"Expected SLOT_TIMEOUT=30.0, got {config.SLOT_TIMEOUT}"
+        )
     finally:
         if old is not None:
             os.environ["SLOT_TIMEOUT"] = old
@@ -848,6 +949,7 @@ def test_slot_timeout_config():
 
 
 # ── Cancellation handling tests ──────────────────────────────────────
+
 
 def test_non_streaming_cancelled_error_releases_slot():
     """Behavioral: when non-streaming chat raises CancelledError, slot is released."""
@@ -861,15 +963,21 @@ def test_non_streaming_cancelled_error_releases_slot():
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
     from backend_manager import DiscoveredModel
+
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
-        name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
-        total_slots=1, last_discovered=0.0,
+        name="ModelA",
+        n_ctx=4096,
+        backends=["10.0.0.1:8000"],
+        total_slots=1,
+        last_discovered=0.0,
     )
 
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(side_effect=asyncio.CancelledError())
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
@@ -905,7 +1013,9 @@ def test_streaming_save_after_skipped_on_cancel():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         mock_resp = AsyncMock()
@@ -915,14 +1025,24 @@ def test_streaming_save_after_skipped_on_cancel():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", "prefix", ["blk1"], sm)
+        reader = StreamReader(
+            mock_resp,
+            mock_req,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            "prefix",
+            ["blk1"],
+            sm,
+        )
         reader._cancelled = True
         await reader._cleanup()
 
         # save_after should be skipped when cancelled
-        assert not mock_client.save_slot.called, \
+        assert not mock_client.save_slot.called, (
             "save_after should be skipped when _cancelled is True"
+        )
 
     asyncio.run(_run())
     print("PASS: test_streaming_save_after_skipped_on_cancel")
@@ -946,7 +1066,9 @@ def test_streaming_save_after_exception():
             raise ConnectionError("connection refused")
 
         mock_client.save_slot = failing_save
-        backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+        backend_manager._backends["10.0.0.1:8000"] = type(
+            "obj", (object,), {"client": mock_client, "agent_client": None}
+        )()
 
         mock_resp = AsyncMock()
         mock_resp.aiter_raw = MagicMock(return_value=iter([]))
@@ -955,11 +1077,21 @@ def test_streaming_save_after_exception():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", 10, ["blk1"], sm)
+        reader = StreamReader(
+            mock_resp,
+            mock_req,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            10,
+            ["blk1"],
+            sm,
+        )
 
         ok = await reader._save()
         assert not ok, "_save should return False on exception"
+
     asyncio.run(_run())
     print("PASS: test_streaming_save_after_exception")
 
@@ -980,7 +1112,9 @@ def test_streaming_gen_sets_cancelled_flag():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         # Iterator that hangs — reader will block waiting for data
@@ -995,8 +1129,17 @@ def test_streaming_gen_sets_cancelled_flag():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", "prefix", ["blk1"], sm)
+        reader = StreamReader(
+            mock_resp,
+            mock_req,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            "prefix",
+            ["blk1"],
+            sm,
+        )
 
         # Start consuming the stream
         stream_gen = reader.stream()
@@ -1013,12 +1156,16 @@ def test_streaming_gen_sets_cancelled_flag():
         elapsed = time.monotonic() - t0
 
         # Should complete quickly
-        assert elapsed < 6, f"Cancel should complete within 5s timeout, took {elapsed:.1f}s"
+        assert elapsed < 6, (
+            f"Cancel should complete within 5s timeout, took {elapsed:.1f}s"
+        )
         # resp.aclose() should have been called to break the socket read
         assert mock_resp.aclose.called, "resp.aclose() should be called on cancel"
         # The cancelled flag should have been set, so save_after should NOT be called
         assert reader._cancelled, "_cancelled should be True after CancelledError"
-        assert not mock_client.save_slot.called, "save_after should be skipped when gen is cancelled"
+        assert not mock_client.save_slot.called, (
+            "save_after should be skipped when gen is cancelled"
+        )
 
     asyncio.run(_run())
     print("PASS: test_streaming_gen_sets_cancelled_flag")
@@ -1036,15 +1183,21 @@ def test_streaming_release_not_in_outer_finally():
     sm = SlotManager()
     sm._ensure_pool("ModelA", "10.0.0.1:8000", 1)
     from backend_manager import DiscoveredModel
+
     backend_manager._discovered_models["ModelA"] = DiscoveredModel(
-        name="ModelA", n_ctx=4096, backends=["10.0.0.1:8000"],
-        total_slots=1, last_discovered=0.0,
+        name="ModelA",
+        n_ctx=4096,
+        backends=["10.0.0.1:8000"],
+        total_slots=1,
+        last_discovered=0.0,
     )
 
     mock_client = AsyncMock()
     mock_client.chat_completions = AsyncMock(return_value=AsyncMock(status_code=200))
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         g, _ = await sm.acquire_for_request([("10.0.0.1:8000", "ModelA")])
@@ -1082,7 +1235,9 @@ def test_reader_polls_is_disconnected_on_timeout():
 
     mock_client = AsyncMock()
     mock_client.save_slot = AsyncMock(return_value=(False, 0))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         # Iterator that never yields — forces timeout path
@@ -1097,8 +1252,17 @@ def test_reader_polls_is_disconnected_on_timeout():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=True)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "test_key", "prefix", ["blk1"], sm)
+        reader = StreamReader(
+            mock_resp,
+            mock_req,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "test_key",
+            "prefix",
+            ["blk1"],
+            sm,
+        )
 
         # Consume generator — reader should timeout on iterator,
         # check is_disconnected, see True, set cancelled, and exit
@@ -1110,11 +1274,17 @@ def test_reader_polls_is_disconnected_on_timeout():
 
         # Reader should detect disconnect quickly (~0.5s heartbeat interval)
         # stream() may take up to STREAM_QUEUE_TIMEOUT to exit after reader finishes
-        assert elapsed < 10, f"Stream should exit within reasonable time, took {elapsed:.1f}s"
-        assert mock_req.is_disconnected.called, "Reader should have polled is_disconnected"
+        assert elapsed < 10, (
+            f"Stream should exit within reasonable time, took {elapsed:.1f}s"
+        )
+        assert mock_req.is_disconnected.called, (
+            "Reader should have polled is_disconnected"
+        )
         assert reader._cancelled, "_cancelled should be True after disconnect"
         # save_after should NOT be called since stream never completed
-        assert not mock_client.save_slot.called, "save_after should be skipped on disconnect"
+        assert not mock_client.save_slot.called, (
+            "save_after should be skipped on disconnect"
+        )
 
     asyncio.run(_run())
     print("PASS: test_reader_polls_is_disconnected_on_timeout")
@@ -1138,16 +1308,19 @@ def test_streaming_completion_releases_slot():
 
     mock_client = AsyncMock(spec=LlamaClient)
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     async def _run():
         # Iterator yields chunks then finishes (normal completion)
         class DoneAIter:
             _done = False
+
             async def __anext__(self):
                 if not self._done:
                     self._done = True
-                    return b"event: content\ndata: {\"text\":\"hi\"}\n\n"
+                    return b'event: content\ndata: {"text":"hi"}\n\n'
                 raise StopAsyncIteration()
 
         mock_resp = AsyncMock()
@@ -1158,8 +1331,17 @@ def test_streaming_completion_releases_slot():
         mock_req = AsyncMock()
         mock_req.is_disconnected = AsyncMock(return_value=False)
 
-        reader = StreamReader(mock_resp, mock_req, "ModelA", "10.0.0.1:8000", 0,
-                              "complete_key", "system: hello\nuser: hi", ["blk1"], sm)
+        reader = StreamReader(
+            mock_resp,
+            mock_req,
+            "ModelA",
+            "10.0.0.1:8000",
+            0,
+            "complete_key",
+            "system: hello\nuser: hi",
+            ["blk1"],
+            sm,
+        )
 
         # Consume all chunks
         chunks = []
@@ -1174,12 +1356,14 @@ def test_streaming_completion_releases_slot():
         assert len(chunks) >= 1, "Should receive at least one chunk"
 
         # Slot saved and released
-        assert mock_client.save_slot.called, \
+        assert mock_client.save_slot.called, (
             "save_slot must be called on normal completion"
+        )
 
         # Pool state: slot 0 should be free
-        assert sm._last_used.get(("ModelA", "10.0.0.1:8000", 0), 0.0) == 0.0, \
+        assert sm._last_used.get(("ModelA", "10.0.0.1:8000", 0), 0.0) == 0.0, (
             "Slot must be free after completion"
+        )
 
     asyncio.run(_run())
     print("PASS: test_streaming_completion_releases_slot")
@@ -1194,8 +1378,17 @@ def test_discover_models_router_mode():
     mock_resp = MagicMock()
     mock_resp.json.return_value = {
         "data": [
-            {"id": "model-a", "status": {"value": "loaded", "args": ["llama-server", "-ctx", "32768"]}},
-            {"id": "model-b", "status": {"value": "loaded", "args": ["llama-server", "-c", "8192"]}},
+            {
+                "id": "model-a",
+                "status": {
+                    "value": "loaded",
+                    "args": ["llama-server", "-ctx", "32768"],
+                },
+            },
+            {
+                "id": "model-b",
+                "status": {"value": "loaded", "args": ["llama-server", "-c", "8192"]},
+            },
         ]
     }
     client.client.get = AsyncMock(return_value=mock_resp)
@@ -1284,9 +1477,7 @@ def test_discover_models_non_router_meta_null():
 
     client = LlamaClient("http://10.0.0.1:8000")
     mock_resp = MagicMock()
-    mock_resp.json.return_value = {
-        "data": [{"id": "model-z", "meta": None}]
-    }
+    mock_resp.json.return_value = {"data": [{"id": "model-z", "meta": None}]}
     client.client.get = AsyncMock(return_value=mock_resp)
 
     async def _run():
@@ -1314,18 +1505,26 @@ def test_discover_models_both_endpoints_fail():
 
 # ── Model resolution tests ─────────────────────────────────────────────
 
+
 def test_resolve_exact_match():
     """Model 'qwen3.6-32b' discovered. Request 'qwen3.6-32b'."""
     from backend_manager import backend_manager, DiscoveredModel
 
     backend_manager._backends.clear()
     backend_manager._discovered_models.clear()
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None})()
-    backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': AsyncMock(), 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": AsyncMock(), "agent_client": None}
+    )()
+    backend_manager._backends["10.0.0.1:9000"] = type(
+        "obj", (object,), {"client": AsyncMock(), "agent_client": None}
+    )()
 
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
-        name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000", "10.0.0.1:9000"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-32b",
+        n_ctx=32768,
+        backends=["10.0.0.1:8000", "10.0.0.1:9000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_discovered_models("qwen3.6-32b")
@@ -1341,8 +1540,11 @@ def test_resolve_substring_match():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b-instruct"] = DiscoveredModel(
-        name="qwen3.6-32b-instruct", n_ctx=32768, backends=["10.0.0.1:8000"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-32b-instruct",
+        n_ctx=32768,
+        backends=["10.0.0.1:8000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_discovered_models("qwen3.6")
@@ -1358,12 +1560,18 @@ def test_resolve_ambiguous_substring():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
-        name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-32b",
+        n_ctx=32768,
+        backends=["10.0.0.1:8000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
     backend_manager._discovered_models["qwen3.6-8b"] = DiscoveredModel(
-        name="qwen3.6-8b", n_ctx=8192, backends=["10.0.0.1:9000"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-8b",
+        n_ctx=8192,
+        backends=["10.0.0.1:9000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_discovered_models("qwen3.6")
@@ -1380,12 +1588,18 @@ def test_resolve_any():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
-        name="qwen3.6-32b", n_ctx=32768, backends=["10.0.0.1:8000"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-32b",
+        n_ctx=32768,
+        backends=["10.0.0.1:8000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
     backend_manager._discovered_models["gemma-3-12b"] = DiscoveredModel(
-        name="gemma-3-12b", n_ctx=16384, backends=["10.0.0.1:9000"],
-        total_slots=0, last_discovered=0.0,
+        name="gemma-3-12b",
+        n_ctx=16384,
+        backends=["10.0.0.1:9000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_discovered_models("any")
@@ -1420,9 +1634,11 @@ def test_resolve_any_no_models():
 
 # ── Cache-first routing tests ──────────────────────────────────────────
 
+
 def test_cache_hit_selects_best_ratio():
     """Two backends have cache hits (ratios 0.95 and 0.70). Select 0.95."""
     from kv_meta_manager import KVMetaManager
+
     mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
@@ -1432,18 +1648,25 @@ def test_cache_hit_selects_best_ratio():
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
         import hashing as hs
+
         old_meta_dir = config.META_DIR
         config.META_DIR = tmpdir
 
         try:
             backend_manager._discovered_models.clear()
             backend_manager._discovered_models["model-a"] = DiscoveredModel(
-                name="model-a", n_ctx=32768, backends=["be1"],
-                total_slots=0, last_discovered=0.0,
+                name="model-a",
+                n_ctx=32768,
+                backends=["be1"],
+                total_slots=0,
+                last_discovered=0.0,
             )
             backend_manager._discovered_models["model-b"] = DiscoveredModel(
-                name="model-b", n_ctx=32768, backends=["be2"],
-                total_slots=0, last_discovered=0.0,
+                name="model-b",
+                n_ctx=32768,
+                backends=["be2"],
+                total_slots=0,
+                last_discovered=0.0,
             )
 
             prefix = "the quick brown fox jumps over the lazy dog"
@@ -1475,7 +1698,9 @@ def test_cache_hit_selects_best_ratio():
                         best_restore_key = mk
                         best_canonical = opt_name
 
-            assert best_canonical == "model-a", f"Expected model-a, got {best_canonical}"
+            assert best_canonical == "model-a", (
+                f"Expected model-a, got {best_canonical}"
+            )
             assert best_ratio == 1.0, f"Expected ratio 1.0, got {best_ratio}"
         finally:
             config.META_DIR = old_meta_dir
@@ -1486,6 +1711,7 @@ def test_cache_hit_selects_best_ratio():
 def test_cache_hit_across_canonical_models():
     """Client requests 'qwen3.6', resolves to two canonical models. Each has a cache hit."""
     from kv_meta_manager import KVMetaManager
+
     mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
@@ -1494,18 +1720,25 @@ def test_cache_hit_across_canonical_models():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
+
         old_meta_dir = config.META_DIR
         config.META_DIR = tmpdir
 
         try:
             backend_manager._discovered_models.clear()
             backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
-                name="qwen3.6-32b", n_ctx=32768, backends=["be1"],
-                total_slots=0, last_discovered=0.0,
+                name="qwen3.6-32b",
+                n_ctx=32768,
+                backends=["be1"],
+                total_slots=0,
+                last_discovered=0.0,
             )
             backend_manager._discovered_models["qwen3.6-8b"] = DiscoveredModel(
-                name="qwen3.6-8b", n_ctx=8192, backends=["be2"],
-                total_slots=0, last_discovered=0.0,
+                name="qwen3.6-8b",
+                n_ctx=8192,
+                backends=["be2"],
+                total_slots=0,
+                last_discovered=0.0,
             )
 
             prefix = "hello world this is a test prompt"
@@ -1532,7 +1765,9 @@ def test_cache_hit_across_canonical_models():
                         best_ratio = cand[1]
                         best_canonical = dm.name
 
-            assert best_canonical == "qwen3.6-8b", f"Expected qwen3.6-8b (higher ratio), got {best_canonical}"
+            assert best_canonical == "qwen3.6-8b", (
+                f"Expected qwen3.6-8b (higher ratio), got {best_canonical}"
+            )
         finally:
             config.META_DIR = old_meta_dir
 
@@ -1548,6 +1783,7 @@ def test_no_cache_fallback_lru():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
+
         old_meta_dir = config.META_DIR
         old_cache_dir = config.CACHE_DIR
         config.META_DIR = tmpdir
@@ -1561,14 +1797,18 @@ def test_no_cache_fallback_lru():
             mock_client = AsyncMock()
             mock_client.discover_models = AsyncMock(return_value=[("model-a", 32768)])
             mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}, {"id": 1}])
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+            backend_manager._backends["10.0.0.1:8000"] = type(
+                "obj", (object,), {"client": mock_client, "agent_client": None}
+            )()
 
             sm = SlotManager()
 
             async def _run():
                 await backend_manager.discover_models()
-                        # No cache files exist, so acquire should fall back to LRU
-                g, restored = await sm.acquire_for_request([("10.0.0.1:8000", "model-a")], prompt_tokens=10)
+                # No cache files exist, so acquire should fall back to LRU
+                g, restored = await sm.acquire_for_request(
+                    [("10.0.0.1:8000", "model-a")], prompt_tokens=10
+                )
                 return g
 
             result = asyncio.run(_run())
@@ -1588,7 +1828,9 @@ def test_meta_key_uses_canonical_name():
 
     canonical = "qwen3.6-32b-instruct"
     token_ids = [123, 456, 789]
-    expected = hashlib.sha256(f"{canonical}\n{','.join(str(t) for t in token_ids)}".encode("utf-8")).hexdigest()
+    expected = hashlib.sha256(
+        f"{canonical}\n{','.join(str(t) for t in token_ids)}".encode("utf-8")
+    ).hexdigest()
     result = meta_key(canonical, token_ids)
     assert result == expected, f"Expected {expected}, got {result}"
     print("PASS: test_meta_key_uses_canonical_name")
@@ -1596,14 +1838,18 @@ def test_meta_key_uses_canonical_name():
 
 # ── Context length tests ───────────────────────────────────────────────
 
+
 def test_get_model_n_ctx_exact():
     """Model 'qwen3.6-32b' with n_ctx 32768. Returns 32768."""
     from backend_manager import backend_manager, DiscoveredModel
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["qwen3.6-32b"] = DiscoveredModel(
-        name="qwen3.6-32b", n_ctx=32768, backends=["be1"],
-        total_slots=0, last_discovered=0.0,
+        name="qwen3.6-32b",
+        n_ctx=32768,
+        backends=["be1"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_model_n_ctx("qwen3.6-32b")
@@ -1617,8 +1863,11 @@ def test_get_model_n_ctx_min_across_backends():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
-        name="model-a", n_ctx=8192, backends=["be1", "be2"],
-        total_slots=0, last_discovered=0.0,
+        name="model-a",
+        n_ctx=8192,
+        backends=["be1", "be2"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     result = backend_manager.get_model_n_ctx("model-a")
@@ -1636,16 +1885,22 @@ def test_prompt_too_long_rejected():
     backend_manager._first_key = "10.0.0.1:8000"
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
-        name="model-a", n_ctx=4096, backends=["10.0.0.1:8000"],
-        total_slots=0, last_discovered=0.0,
+        name="model-a",
+        n_ctx=4096,
+        backends=["10.0.0.1:8000"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     mock_client = AsyncMock()
     mock_client.tokenize = AsyncMock(return_value=[0] * 4097)
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
+
     sm = SlotManager()
     sm._ensure_pool("model-a", "10.0.0.1:8000", 1)
     app_mod.app.state.sm = sm
@@ -1654,10 +1909,13 @@ def test_prompt_too_long_rejected():
     long_text = "word " * 4096
     messages = [{"role": "user", "content": long_text}]
 
-    resp = client.post("/v1/chat/completions", json={
-        "model": "model-a",
-        "messages": messages,
-    })
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "model-a",
+            "messages": messages,
+        },
+    )
 
     assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
     assert "prompt too long" in resp.json()["error"].lower()
@@ -1665,6 +1923,7 @@ def test_prompt_too_long_rejected():
 
 
 # ── /v1/models endpoint tests ──────────────────────────────────────────
+
 
 def test_models_endpoint_includes_any():
     """Mock refresh_models to return 2 models. Response includes both models plus 'any'."""
@@ -1674,12 +1933,18 @@ def test_models_endpoint_includes_any():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
-        name="model-a", n_ctx=32768, backends=["be1"],
-        total_slots=0, last_discovered=0.0,
+        name="model-a",
+        n_ctx=32768,
+        backends=["be1"],
+        total_slots=0,
+        last_discovered=0.0,
     )
     backend_manager._discovered_models["model-b"] = DiscoveredModel(
-        name="model-b", n_ctx=16384, backends=["be2"],
-        total_slots=0, last_discovered=0.0,
+        name="model-b",
+        n_ctx=16384,
+        backends=["be2"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     client = TestClient(app_mod.app)
@@ -1701,8 +1966,11 @@ def test_models_endpoint_openai_format():
 
     backend_manager._discovered_models.clear()
     backend_manager._discovered_models["model-a"] = DiscoveredModel(
-        name="model-a", n_ctx=32768, backends=["be1"],
-        total_slots=0, last_discovered=0.0,
+        name="model-a",
+        n_ctx=32768,
+        backends=["be1"],
+        total_slots=0,
+        last_discovered=0.0,
     )
 
     client = TestClient(app_mod.app)
@@ -1718,6 +1986,7 @@ def test_models_endpoint_openai_format():
 
 # ── Chat completion tests ──────────────────────────────────────────────
 
+
 def test_chat_substring_model_resolution():
     """Client requests 'qwen3.6', backend serves 'qwen3.6-32b-instruct'. Slot acquired on correct backend."""
     from fastapi.testclient import TestClient
@@ -1731,31 +2000,43 @@ def test_chat_substring_model_resolution():
     backend_manager._first_key = "10.0.0.1:8000"
 
     mock_client = AsyncMock(spec=LlamaClient)
-    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
-    mock_client.discover_models = AsyncMock(return_value=[("qwen3.6-32b-instruct", 32768)])
+    mock_client.chat_completions = AsyncMock(
+        return_value={"object": "chat.completion", "choices": []}
+    )
+    mock_client.discover_models = AsyncMock(
+        return_value=[("qwen3.6-32b-instruct", 32768)]
+    )
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
+
     sm = SlotManager()
     sm._ensure_pool("qwen3.6-32b-instruct", "10.0.0.1:8000", 1)
     app_mod.app.state.sm = sm
 
     client = TestClient(app_mod.app)
-    resp = client.post("/v1/chat/completions", json={
-        "model": "qwen3.6",
-        "messages": [{"role": "user", "content": "hello"}],
-    })
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3.6",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     # Verify canonical name was forwarded
     call_args = mock_client.chat_completions.call_args
     assert call_args is not None
     body = call_args[0][0]
-    assert body["model"] == "qwen3.6-32b-instruct", f"Expected canonical name, got {body['model']}"
+    assert body["model"] == "qwen3.6-32b-instruct", (
+        f"Expected canonical name, got {body['model']}"
+    )
     print("PASS: test_chat_substring_model_resolution")
 
 
@@ -1769,14 +2050,18 @@ def test_chat_model_not_found_400():
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
+
     sm = SlotManager()
     app_mod.app.state.sm = sm
 
     client = TestClient(app_mod.app)
-    resp = client.post("/v1/chat/completions", json={
-        "model": "unknown-model",
-        "messages": [{"role": "user", "content": "hello"}],
-    })
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "unknown-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
 
     assert resp.status_code == 400, f"Expected 400, got {resp.status_code}"
     assert "not found" in resp.json()["error"].lower()
@@ -1796,24 +2081,32 @@ def test_chat_any_model_routing():
     backend_manager._first_key = "10.0.0.1:8000"
 
     mock_client = AsyncMock(spec=LlamaClient)
-    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+    mock_client.chat_completions = AsyncMock(
+        return_value={"object": "chat.completion", "choices": []}
+    )
     mock_client.discover_models = AsyncMock(return_value=[("model-x", 16384)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     # Set up app state (normally done in startup event)
     from slot_manager import SlotManager
+
     sm = SlotManager()
     sm._ensure_pool("model-x", "10.0.0.1:8000", 1)
     app_mod.app.state.sm = sm
 
     client = TestClient(app_mod.app)
-    resp = client.post("/v1/chat/completions", json={
-        "model": "any",
-        "messages": [{"role": "user", "content": "hello"}],
-    })
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "any",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     call_args = mock_client.chat_completions.call_args
@@ -1826,6 +2119,7 @@ def test_chat_any_model_routing():
 def test_chat_any_with_cache_hit():
     """Client requests 'any', multiple canonical models have cache hits. Selects best cache hit."""
     from kv_meta_manager import KVMetaManager
+
     mgr = KVMetaManager()
     from hashing import meta_key
     from backend_manager import backend_manager, DiscoveredModel
@@ -1837,6 +2131,7 @@ def test_chat_any_with_cache_hit():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         import config
+
         old_meta_dir = config.META_DIR
         old_cache_dir = config.CACHE_DIR
         config.META_DIR = tmpdir
@@ -1848,12 +2143,18 @@ def test_chat_any_with_cache_hit():
             backend_manager._first_key = "10.0.0.1:8000"
 
             backend_manager._discovered_models["model-a"] = DiscoveredModel(
-                name="model-a", n_ctx=32768, backends=["10.0.0.1:8000"],
-                total_slots=1, last_discovered=0.0,
+                name="model-a",
+                n_ctx=32768,
+                backends=["10.0.0.1:8000"],
+                total_slots=1,
+                last_discovered=0.0,
             )
             backend_manager._discovered_models["model-b"] = DiscoveredModel(
-                name="model-b", n_ctx=16384, backends=["10.0.0.1:9000"],
-                total_slots=1, last_discovered=0.0,
+                name="model-b",
+                n_ctx=16384,
+                backends=["10.0.0.1:9000"],
+                total_slots=1,
+                last_discovered=0.0,
             )
 
             # Create meta files: model-a has ratio 0.95, model-b has ratio 0.70
@@ -1868,35 +2169,53 @@ def test_chat_any_with_cache_hit():
             mgr.write_meta(key_b, 10, blocks_b, 100, "model-b", "10.0.0.1:9000")
 
             mock_client_a = AsyncMock(spec=LlamaClient)
-            mock_client_a.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
-            mock_client_a.discover_models = AsyncMock(return_value=[("model-a", 32768), ("model-b", 16384)])
+            mock_client_a.chat_completions = AsyncMock(
+                return_value={"object": "chat.completion", "choices": []}
+            )
+            mock_client_a.discover_models = AsyncMock(
+                return_value=[("model-a", 32768), ("model-b", 16384)]
+            )
             mock_client_a.get_slots_info = AsyncMock(return_value=[{"id": 0}])
             mock_client_a.tokenize = AsyncMock(return_value=token_ids)
             mock_client_a.save_slot = AsyncMock(return_value=(True, 1024))
             mock_client_b = AsyncMock(spec=LlamaClient)
             mock_client_b.tokenize = AsyncMock(return_value=token_ids)
-            backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client_a, 'agent_client': None})()
-            backend_manager._backends["10.0.0.1:9000"] = type('obj', (object,), {'client': mock_client_b, 'agent_client': None})()
+            backend_manager._backends["10.0.0.1:8000"] = type(
+                "obj", (object,), {"client": mock_client_a, "agent_client": None}
+            )()
+            backend_manager._backends["10.0.0.1:9000"] = type(
+                "obj", (object,), {"client": mock_client_b, "agent_client": None}
+            )()
 
             # Set up app state (normally done in startup event)
             from slot_manager import SlotManager
+
             sm = SlotManager()
             sm._ensure_pool("model-a", "10.0.0.1:8000", 1)
             sm._ensure_pool("model-b", "10.0.0.1:9000", 1)
             app_mod.app.state.sm = sm
 
             client = TestClient(app_mod.app)
-            resp = client.post("/v1/chat/completions", json={
-                "model": "any",
-                "messages": [{"role": "user", "content": "test prompt for cache hit"}],
-            })
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "any",
+                    "messages": [
+                        {"role": "user", "content": "test prompt for cache hit"}
+                    ],
+                },
+            )
 
-            assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+            assert resp.status_code == 200, (
+                f"Expected 200, got {resp.status_code}: {resp.text}"
+            )
             call_args = mock_client_a.chat_completions.call_args
             assert call_args is not None
             body = call_args[0][0]
             # Should have routed to model-a (better cache hit)
-            assert body["model"] == "model-a", f"Expected model-a (best cache), got {body['model']}"
+            assert body["model"] == "model-a", (
+                f"Expected model-a (best cache), got {body['model']}"
+            )
         finally:
             config.META_DIR = old_meta_dir
             config.CACHE_DIR = old_cache_dir
@@ -1920,9 +2239,11 @@ def test_acquire_for_request_retries_on_lock_timeout():
 
         backend_manager._discovered_models = {
             "ModelA": DiscoveredModel(
-                name="ModelA", n_ctx=4096,
+                name="ModelA",
+                n_ctx=4096,
                 backends=["10.0.0.1:8000", "10.0.0.2:8000"],
-                total_slots=4, last_discovered=time.time(),
+                total_slots=4,
+                last_discovered=time.time(),
             ),
         }
 
@@ -1933,7 +2254,9 @@ def test_acquire_for_request_retries_on_lock_timeout():
         restore_info = ("test_key", "10.0.0.1:8000", "ModelA")
         candidate_backends = [("10.0.0.2:8000", "ModelA")]
         g, restored = await sm.acquire_for_request(
-            candidate_backends, restore_info, prompt_tokens=10,
+            candidate_backends,
+            restore_info,
+            prompt_tokens=10,
         )
         model_name, be_id, slot_id = g
         assert be_id == "10.0.0.2:8000", f"Expected backend 2, got {be_id}"
@@ -1946,6 +2269,7 @@ def test_acquire_for_request_retries_on_lock_timeout():
 
 
 # ── Cache save ratio threshold tests ────────────────────────────────────
+
 
 def test_chat_save_skipped_when_ratio_above_threshold():
     """Non-streaming chat should skip save when restore ratio >= threshold."""
@@ -1961,18 +2285,34 @@ def test_chat_save_skipped_when_ratio_above_threshold():
     backend_manager._first_key = "10.0.0.1:8000"
 
     mock_client = AsyncMock(spec=LlamaClient)
-    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": [], "usage": {"prompt_tokens": 3, "prompt_tokens_details": {"cached_tokens": 3}}})
+    mock_client.chat_completions = AsyncMock(
+        return_value={
+            "object": "chat.completion",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 3},
+            },
+        }
+    )
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.tokenize = AsyncMock(return_value=[123, 456, 789])
-    mock_client.apply_chat_template = AsyncMock(return_value="user: hello world\nassistant:")
+    mock_client.apply_chat_template = AsyncMock(
+        return_value="user: hello world\nassistant:"
+    )
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     mock_client.get_slot_status = AsyncMock(return_value={"cached_tokens": 3})
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
-        name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
-        total_slots=1, last_discovered=0.0
+        name="test-model",
+        backends=["10.0.0.1:8000"],
+        n_ctx=32768,
+        total_slots=1,
+        last_discovered=0.0,
     )
 
     sm = SlotManager()
@@ -1981,20 +2321,29 @@ def test_chat_save_skipped_when_ratio_above_threshold():
 
     save_called = []
     original_save = sm.save_after
+
     async def track_save(*args, **kwargs):
         save_called.append(True)
         return await original_save(*args, **kwargs)
+
     sm.save_after = track_save
 
-    with patch("hashing.block_hashes_from_tokens", return_value=["hash1"]), \
-         patch("kv_meta_manager.KVMetaManager.find_best_restore_candidate", return_value=("test_key", 0.95)):
-
+    with (
+        patch("hashing.block_hashes_from_tokens", return_value=["hash1"]),
+        patch(
+            "kv_meta_manager.KVMetaManager.find_best_restore_candidate",
+            return_value=("test_key", 0.95),
+        ),
+    ):
         client = TestClient(app_mod.app)
-        resp = client.post("/v1/chat/completions", json={
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "hello world"}],
-            "stream": False,
-        })
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello world"}],
+                "stream": False,
+            },
+        )
 
     assert resp.status_code == 200
     assert len(save_called) == 0, f"Expected no save calls, got {len(save_called)}"
@@ -2015,17 +2364,26 @@ def test_chat_save_performed_when_ratio_below_threshold():
     backend_manager._first_key = "10.0.0.1:8000"
 
     mock_client = AsyncMock(spec=LlamaClient)
-    mock_client.chat_completions = AsyncMock(return_value={"object": "chat.completion", "choices": []})
+    mock_client.chat_completions = AsyncMock(
+        return_value={"object": "chat.completion", "choices": []}
+    )
     mock_client.discover_models = AsyncMock(return_value=[("test-model", 32768)])
     mock_client.get_slots_info = AsyncMock(return_value=[{"id": 0}])
     mock_client.save_slot = AsyncMock(return_value=(True, 1024))
     mock_client.tokenize = AsyncMock(return_value=list(range(600)))
-    mock_client.apply_chat_template = AsyncMock(return_value="user: big prompt for testing\nassistant:")
-    backend_manager._backends["10.0.0.1:8000"] = type('obj', (object,), {'client': mock_client, 'agent_client': None})()
+    mock_client.apply_chat_template = AsyncMock(
+        return_value="user: big prompt for testing\nassistant:"
+    )
+    backend_manager._backends["10.0.0.1:8000"] = type(
+        "obj", (object,), {"client": mock_client, "agent_client": None}
+    )()
 
     backend_manager._discovered_models["test-model"] = DiscoveredModel(
-        name="test-model", backends=["10.0.0.1:8000"], n_ctx=32768,
-        total_slots=1, last_discovered=0.0
+        name="test-model",
+        backends=["10.0.0.1:8000"],
+        n_ctx=32768,
+        total_slots=1,
+        last_discovered=0.0,
     )
 
     sm = SlotManager()
@@ -2034,25 +2392,202 @@ def test_chat_save_performed_when_ratio_below_threshold():
 
     save_called = []
     original_save = sm.save_after
+
     async def track_save(*args, **kwargs):
         save_called.append(True)
         return await original_save(*args, **kwargs)
+
     sm.save_after = track_save
 
-    with patch("hashing.block_hashes_from_tokens", return_value=[f"hash{i}" for i in range(6)]), \
-         patch("kv_meta_manager.KVMetaManager.find_best_restore_candidate", return_value=("test_key", 0.5)), \
-         patch("kv_meta_manager.KVMetaManager.write_meta"):
-
+    with (
+        patch(
+            "hashing.block_hashes_from_tokens",
+            return_value=[f"hash{i}" for i in range(6)],
+        ),
+        patch(
+            "kv_meta_manager.KVMetaManager.find_best_restore_candidate",
+            return_value=("test_key", 0.5),
+        ),
+        patch("kv_meta_manager.KVMetaManager.write_meta"),
+    ):
         client = TestClient(app_mod.app)
-        resp = client.post("/v1/chat/completions", json={
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "big prompt for testing"}],
-            "stream": False,
-        })
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "big prompt for testing"}],
+                "stream": False,
+            },
+        )
 
     assert resp.status_code == 200
     assert len(save_called) == 1, f"Expected 1 save call, got {len(save_called)}"
     print("PASS: test_chat_save_performed_when_ratio_below_threshold")
+
+
+# ── Logging tests ──────────────────────────────────────────────────────
+
+
+def test_log_file_env_var():
+    """LOG_FILE env var should create a FileHandler when set."""
+    import logging
+    import tempfile
+
+    old_log_file = os.environ.get("LOG_FILE")
+    old_log_level = os.environ.get("LOG_LEVEL")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = os.path.join(tmpdir, "test.log")
+            os.environ["LOG_FILE"] = log_file
+            os.environ["LOG_LEVEL"] = "DEBUG"
+
+            # Reload config to pick up new env vars
+            import importlib
+            import config
+
+            importlib.reload(config)
+
+            # Verify file handler was added
+            root_logger = logging.getLogger()
+            handlers = root_logger.handlers
+
+            # Should have at least a console handler and a file handler
+            file_handlers = [h for h in handlers if isinstance(h, logging.FileHandler)]
+            assert len(file_handlers) >= 1, (
+                f"Expected file handler, got {[type(h).__name__ for h in handlers]}"
+            )
+
+            # Verify log file was created
+            assert os.path.exists(log_file), f"Log file {log_file} was not created"
+
+            # Write a test log entry
+            test_logger = logging.getLogger("test_log_file")
+            test_logger.info("test log entry")
+
+            # Verify log file contains the entry
+            with open(log_file, "r") as f:
+                content = f.read()
+            assert "test log entry" in content, (
+                f"Log file does not contain expected entry: {content}"
+            )
+    finally:
+        if old_log_file is not None:
+            os.environ["LOG_FILE"] = old_log_file
+        elif "LOG_FILE" in os.environ:
+            del os.environ["LOG_FILE"]
+        if old_log_level is not None:
+            os.environ["LOG_LEVEL"] = old_log_level
+        elif "LOG_LEVEL" in os.environ:
+            del os.environ["LOG_LEVEL"]
+
+    print("PASS: test_log_file_env_var")
+
+
+def test_http_logging_middleware():
+    """HTTP middleware should log request/response headers when LOG_LEVEL >= DEBUG."""
+    import logging
+    from fastapi.testclient import TestClient
+    import app as app_mod
+
+    # Set LOG_LEVEL to DEBUG
+    old_log_level = os.environ.get("LOG_LEVEL")
+    os.environ["LOG_LEVEL"] = "DEBUG"
+
+    # Reload config to pick up new LOG_LEVEL
+    import importlib
+    import config
+
+    importlib.reload(config)
+
+    # Reload app to pick up new LOG_LEVEL in middleware
+    importlib.reload(app_mod)
+
+    try:
+        # Capture log output
+        log_capture = []
+
+        class LogCaptureHandler(logging.Handler):
+            def emit(self, record):
+                log_capture.append(self.format(record))
+
+        handler = LogCaptureHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        http_log = logging.getLogger("http")
+        http_log.addHandler(handler)
+        http_log.setLevel(logging.DEBUG)
+
+        try:
+            client = TestClient(app_mod.app)
+            resp = client.get("/v1/models")
+
+            # Verify response was successful
+            assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+
+            # Verify middleware logged the request
+            request_logs = [l for l in log_capture if "GET /v1/models" in l]
+            assert len(request_logs) >= 1, f"Expected request log, got: {log_capture}"
+
+            # Verify middleware logged the response
+            response_logs = [l for l in log_capture if "GET /v1/models -> 200" in l]
+            assert len(response_logs) >= 1, f"Expected response log, got: {log_capture}"
+        finally:
+            http_log.removeHandler(handler)
+    finally:
+        if old_log_level is not None:
+            os.environ["LOG_LEVEL"] = old_log_level
+        elif "LOG_LEVEL" in os.environ:
+            del os.environ["LOG_LEVEL"]
+
+    print("PASS: test_http_logging_middleware")
+
+
+def test_http_logging_skipped_at_info_level():
+    """HTTP middleware should skip logging when LOG_LEVEL is INFO."""
+    import logging
+    from fastapi.testclient import TestClient
+    import app as app_mod
+
+    old_log_level = os.environ.get("LOG_LEVEL")
+    os.environ["LOG_LEVEL"] = "INFO"
+
+    import importlib
+    import config
+
+    importlib.reload(config)
+    importlib.reload(app_mod)
+
+    try:
+        log_capture = []
+
+        class LogCaptureHandler(logging.Handler):
+            def emit(self, record):
+                log_capture.append(self.format(record))
+
+        handler = LogCaptureHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        http_log = logging.getLogger("http")
+        http_log.addHandler(handler)
+        http_log.setLevel(logging.DEBUG)
+
+        try:
+            client = TestClient(app_mod.app)
+            resp = client.get("/v1/models")
+            assert resp.status_code == 200
+
+            # At INFO level, middleware should return early without logging
+            assert len(log_capture) == 0, (
+                f"Expected no logs at INFO level, got: {log_capture}"
+            )
+        finally:
+            http_log.removeHandler(handler)
+    finally:
+        if old_log_level is not None:
+            os.environ["LOG_LEVEL"] = old_log_level
+        elif "LOG_LEVEL" in os.environ:
+            del os.environ["LOG_LEVEL"]
+
+    print("PASS: test_http_logging_skipped_at_info_level")
 
 
 if __name__ == "__main__":
@@ -2155,8 +2690,13 @@ if __name__ == "__main__":
     test_chat_save_skipped_when_ratio_above_threshold()
     test_chat_save_performed_when_ratio_below_threshold()
 
+    # ── Logging tests ────────────────────────────────────────────────────
+
+    test_log_file_env_var()
+    test_http_logging_middleware()
+    test_http_logging_skipped_at_info_level()
+
     print("\nAll smoke tests passed.")
 
 
 # ── Model discovery tests ──────────────────────────────────────────────
-
