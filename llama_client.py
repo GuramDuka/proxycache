@@ -23,31 +23,64 @@ log = logging.getLogger(__name__)
 
 
 class LlamaClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, api_key: str | None = None):
         self.base_url = base_url.rstrip("/")
+        self._api_key = api_key
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=REQUEST_TIMEOUT,
             limits=limits,
         )
-        log.info("Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__)
+        log.info(
+            "Initialized HTTP client for %s (httpx %s)", base_url, httpx.__version__
+        )
+
+    def _auth_headers(
+        self, headers: Dict[str, str] | None = None
+    ) -> Dict[str, str] | None:
+        """Merge provided headers with the client's API key. Per-request headers take priority."""
+        if not self._api_key:
+            return headers
+        merged = {"x-api-key": self._api_key}
+        if headers:
+            merged.update(headers)
+        return merged
 
     async def close(self):
         await self.client.aclose()
 
-    async def apply_chat_template(self, messages: list) -> str:
+    async def apply_chat_template(
+        self,
+        messages: list,
+        model_name: str | None = None,
+        headers: Dict[str, str] | None = None,
+    ) -> str:
+        body: Dict[str, object] = {"messages": messages}
+        if model_name:
+            body["model"] = model_name
         resp = await self.client.post(
             "/apply-template",
-            json={"messages": messages},
+            json=body,
+            headers=self._auth_headers(headers),
         )
         resp.raise_for_status()
         return resp.json().get("prompt", "")
 
-    async def tokenize(self, text: str, add_special: bool = False) -> list[int]:
+    async def tokenize(
+        self,
+        text: str,
+        add_special: bool = False,
+        model_name: str | None = None,
+        headers: Dict[str, str] | None = None,
+    ) -> list[int]:
+        body: Dict[str, object] = {"content": text, "add_special": add_special}
+        if model_name:
+            body["model"] = model_name
         resp = await self.client.post(
             "/tokenize",
-            json={"content": text, "add_special": add_special},
+            json=body,
+            headers=self._auth_headers(headers),
         )
         resp.raise_for_status()
         return resp.json().get("tokens", [])
@@ -79,19 +112,25 @@ class LlamaClient:
         body: Dict,
         slot_id: Optional[int] = None,
         stream: bool = False,
+        headers: Dict[str, str] | None = None,
     ):
         body2, query = self._with_slot_id(body, slot_id)
 
-        log.info("Chat completions: stream=%s, body_stream=%s, %d messages",
-                 stream, body2.get("stream", "MISSING"),
-                 len(body2.get("messages") or []))
+        log.info(
+            "Chat completions: stream=%s, body_stream=%s, %d messages",
+            stream,
+            body2.get("stream", "MISSING"),
+            len(body2.get("messages") or []),
+        )
 
+        auth_headers = self._auth_headers(headers)
         if stream:
             req = self.client.build_request(
                 "POST",
                 "/v1/chat/completions",
                 json=body2,
                 params=query,
+                headers=auth_headers,
             )
             resp = await self.client.send(req, stream=True)
             return resp
@@ -100,6 +139,7 @@ class LlamaClient:
             "/v1/chat/completions",
             json=body2,
             params=query,
+            headers=auth_headers,
         )
         resp.raise_for_status()
 
@@ -133,7 +173,9 @@ class LlamaClient:
                 "raw": raw[:2048],
             }
 
-    async def save_slot(self, slot_id: int, basename: str, model_name: str = None) -> Tuple[bool, int]:
+    async def save_slot(
+        self, slot_id: int, basename: str, model_name: str = None
+    ) -> Tuple[bool, int]:
         # JSON body: {"filename": "..."} — avoids 500 on some builds
         if BACKEND_MODE == "llama-swap" and model_name:
             path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
@@ -145,17 +187,21 @@ class LlamaClient:
                 path,
                 params={"action": "save"},
                 json={"filename": basename, "model": model_name},
+                headers=self._auth_headers(),
             )
         except Exception as e:
             log.warning(
                 "Save slot failed: slot=%d, file=%s, error=%s",
-                slot_id, basename[:16], e,
+                slot_id,
+                basename[:16],
+                e,
             )
             return False, 0
 
-        if resp.status_code == 500:
+        if resp.status_code >= 500:
             log.warning(
-                "Save slot returned 500: slot=%d, file=%s",
+                "Save slot returned %d: slot=%d, file=%s",
+                resp.status_code,
                 slot_id,
                 basename[:16],
             )
@@ -169,7 +215,9 @@ class LlamaClient:
             n_written = 0
         return True, n_written
 
-    async def restore_slot(self, slot_id: int, basename: str, model_name: str = None) -> bool:
+    async def restore_slot(
+        self, slot_id: int, basename: str, model_name: str = None
+    ) -> bool:
         if BACKEND_MODE == "llama-swap" and model_name:
             path = f"/upstream/{quote(model_name, safe='')}/slots/{slot_id}"
         else:
@@ -181,13 +229,16 @@ class LlamaClient:
                     path,
                     params={"action": "restore"},
                     json={"filename": basename, "model": model_name},
+                    headers=self._auth_headers(),
                 ),
                 timeout=SLOT_TIMEOUT,
             )
         except asyncio.TimeoutError:
             log.warning(
                 "Restore slot timed out after %ds: slot=%d, file=%s",
-                SLOT_TIMEOUT, slot_id, basename[:16],
+                SLOT_TIMEOUT,
+                slot_id,
+                basename[:16],
             )
             return False
 
@@ -242,7 +293,9 @@ class LlamaClient:
                         pass
                     break
             if port is None:
-                log.warning("Router model '%s' has no port in status args", m.get("id", "?"))
+                log.warning(
+                    "Router model '%s' has no port in status args", m.get("id", "?")
+                )
                 continue
             result.append({"name": m.get("id", ""), "port": port})
         return result
@@ -250,7 +303,9 @@ class LlamaClient:
     async def _get_child_slots(self, child_url: str) -> Optional[list]:
         """GET /slots on a child process, returns list or None."""
         try:
-            resp = await self.client.get(f"{child_url}/slots")
+            resp = await self.client.get(
+                f"{child_url}/slots", headers=self._auth_headers()
+            )
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -270,7 +325,7 @@ class LlamaClient:
         """
         # Fast path: normal (non-router) mode
         try:
-            resp = await self.client.get("/slots")
+            resp = await self.client.get("/slots", headers=self._auth_headers())
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as exc:
@@ -285,7 +340,9 @@ class LlamaClient:
             log.warning("Failed to get slots info from %s: %s", self.base_url, e)
             return None
 
-    async def _get_slots_via_router_models(self, model_name: Optional[str] = None) -> Optional[list]:
+    async def _get_slots_via_router_models(
+        self, model_name: Optional[str] = None
+    ) -> Optional[list]:
         """Query slots from loaded child processes via GET /models.
 
         If model_name is provided, only queries that model's child process.
@@ -302,7 +359,8 @@ class LlamaClient:
             if not models:
                 log.warning(
                     "Model '%s' not loaded, available models: %s",
-                    model_name, [m["name"] for m in models],
+                    model_name,
+                    [m["name"] for m in models],
                 )
                 return None
 
@@ -317,12 +375,15 @@ class LlamaClient:
                 all_slots.extend(slots)
                 log.warn(
                     "Child process %s:%d returned %d slots",
-                    m["name"], m["port"], len(slots),
+                    m["name"],
+                    m["port"],
+                    len(slots),
                 )
             else:
                 log.warning(
                     "Child process %s:%d returned no slots",
-                    m["name"], m["port"],
+                    m["name"],
+                    m["port"],
                 )
 
         if all_slots:
@@ -334,29 +395,40 @@ class LlamaClient:
         """Discover models served by this backend. Returns [(name, n_ctx)]."""
         # Router mode: GET /models
         try:
-            resp = await self.client.get("/models")
+            resp = await self.client.get("/models", headers=self._auth_headers())
             data = resp.json()
-            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            if (
+                isinstance(data, dict)
+                and "data" in data
+                and isinstance(data["data"], list)
+            ):
                 models = []
                 for entry in data["data"]:
-                    status = entry.get("status") or {}
-                    if status.get("value") != "loaded":
-                        continue
                     name = entry.get("id", "")
+                    if not name:
+                        continue
+                    status = entry.get("status") or {}
                     n_ctx = DEFAULT_N_CTX
-                    args = status.get("args") or []
-                    for i, arg in enumerate(args):
-                        if arg in ("-ctx", "-c", "--ctx-size") and i + 1 < len(args):
-                            try:
-                                n_ctx = int(args[i + 1])
-                                break
-                            except ValueError:
-                                pass
-                    if n_ctx == DEFAULT_N_CTX:
-                        loaded = status.get("loaded_info") or {}
-                        n_ctx = loaded.get("n_ctx") or loaded.get("n_ctx_train") or DEFAULT_N_CTX
-                    if name:
-                        models.append((name, int(n_ctx)))
+                    # Try to extract n_ctx from loaded model args
+                    if status.get("value") == "loaded":
+                        args = status.get("args") or []
+                        for i, arg in enumerate(args):
+                            if arg in ("-ctx", "-c", "--ctx-size") and i + 1 < len(
+                                args
+                            ):
+                                try:
+                                    n_ctx = int(args[i + 1])
+                                    break
+                                except ValueError:
+                                    pass
+                        if n_ctx == DEFAULT_N_CTX:
+                            loaded = status.get("loaded_info") or {}
+                            n_ctx = (
+                                loaded.get("n_ctx")
+                                or loaded.get("n_ctx_train")
+                                or DEFAULT_N_CTX
+                            )
+                    models.append((name, int(n_ctx)))
                 if models:
                     return models
         except Exception:
@@ -366,7 +438,11 @@ class LlamaClient:
         try:
             resp = await self.client.get("/v1/models")
             data = resp.json()
-            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            if (
+                isinstance(data, dict)
+                and "data" in data
+                and isinstance(data["data"], list)
+            ):
                 for entry in data["data"]:
                     meta = entry.get("meta")
                     name = entry.get("id", "")

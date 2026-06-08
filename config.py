@@ -65,6 +65,9 @@ SLOT_TIMEOUT = float(os.getenv("SLOT_TIMEOUT", "30"))
 # Cooldown between slot refresh attempts (seconds) — 300s success, 30s failure
 REFRESH_COOLDOWN_SECONDS = int(os.getenv("REFRESH_COOLDOWN_SECONDS", "300"))
 
+# Default API key for all backends (can be overridden per-backend in BACKENDS config)
+BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
+
 # Logs
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
